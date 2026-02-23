@@ -51,7 +51,28 @@ For more detail, please refer to the comprehensive [***LongCat-Video Technical R
 
 ## Quick Start
 
-### Installation
+### Option A: RunPod (Recommended for GPU inference)
+
+The fastest way to get running on a cloud GPU. See [`deploy.md`](deploy.md) for full details.
+
+```bash
+# On a RunPod Pod with network volume mounted at /workspace
+git clone https://github.com/Nicolepcx/LongCat-Video.git /workspace/LongCat-Video
+cd /workspace/LongCat-Video
+chmod +x setup_pod.sh
+./setup_pod.sh    # installs everything + verifies weights
+
+# Run avatar generation
+torchrun --nproc_per_node=1 run_demo_avatar_single_audio_to_video.py \
+  --base_model_dir /workspace/weights/LongCat-Video \
+  --checkpoint_dir /workspace/weights/LongCat-Video-Avatar \
+  --input_json assets/avatar/single_example_1.json
+```
+
+`setup_pod.sh` handles system deps (ffmpeg), Python packages, flash-attn compilation
+(with automatic PyTorch SDPA fallback if flash-attn can't compile), and weight verification.
+
+### Option B: Local / Conda Installation
 
 Clone the repo:
 
@@ -85,6 +106,10 @@ conda install -c conda-forge ffmpeg
 pip install -r requirements_avatar.txt
 
 ```
+
+> **Note:** If `flash-attn` fails to compile on your system, the code will automatically
+> fall back to PyTorch's built-in `scaled_dot_product_attention` (SDPA), which uses the
+> same flash attention CUDA kernels internally. No performance loss on modern GPUs.
 
 FlashAttention-2 is enabled in the model config by default; you can also change the model config ("./weights/LongCat-Video/dit/config.json") to use FlashAttention-3 or xformers once installed.
 
@@ -223,6 +248,17 @@ The *Image-to-Video* MOS evaluation results on our internal benchmark.
 | Visual Quality↑ | 3.22 | 3.18 | 3.23 | 3.27 |
 | Motion Quality↑ | 3.77 | 3.80 | 3.79 | 3.59 |
 | Overall Quality↑ | 3.35 | 3.27 | 3.26 | 3.17 |
+
+## Cloud Deployment
+
+For deploying as a service with a Gradio UI frontend and RunPod GPU backend,
+see the comprehensive [`deploy.md`](deploy.md) guide which covers:
+
+- **RunPod Network Volume** setup for persistent model weights (~200 GB)
+- **`setup_pod.sh`** for one-command pod configuration
+- **RunPod Serverless** endpoint (scale-to-zero, pay-per-second)
+- **DigitalOcean** Gradio UI with password protection ($5/mo)
+- Cost estimates, troubleshooting, and API reference
 
 ## Community Works
 

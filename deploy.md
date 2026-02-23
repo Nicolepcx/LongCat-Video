@@ -1,11 +1,9 @@
 # Deploying LongCat-Video Avatar
 
-Two things to deploy:
+Two deployment options:
 
-1. **RunPod Serverless endpoint** — the GPU worker that runs inference (scales to zero)
-2. **Gradio UI on DigitalOcean** — password-protected frontend to upload audio + image
-
-No local Docker builds needed. RunPod builds from GitHub, DO builds from `Dockerfile.app`.
+1. **RunPod Pod** (recommended) — persistent GPU instance with network volume for weights
+2. **Gradio UI on DigitalOcean** — lightweight password-protected frontend
 
 ---
 
@@ -19,100 +17,152 @@ No local Docker builds needed. RunPod builds from GitHub, DO builds from `Docker
                 │  base64 payload via RunPod API
                 ▼
 ┌────────────────────────────────┐      ┌─────────────────────────────┐
-│  RunPod Serverless Endpoint    │◄────►│  Network Volume             │
-│  Built from GitHub repo        │      │  /runpod-volume/weights/    │
-│  Scales 0 → N GPUs             │      │  ├── LongCat-Video/        │
-│  Returns video as base64       │      │  └── LongCat-Video-Avatar/ │
+│  RunPod Pod / Serverless       │◄────►│  Network Volume (250 GB)    │
+│  A100 80 GB GPU                │      │  /workspace/weights/        │
+│  Returns video as base64       │      │  ├── LongCat-Video/         │
+│                                │      │  └── LongCat-Video-Avatar/  │
 └────────────────────────────────┘      └─────────────────────────────┘
 ```
 
 ---
 
-## Part 1: RunPod Serverless Endpoint
+## Part 1: RunPod Setup
 
-### 1.1 — Push repo to GitHub
-
-Make sure the repo is pushed to GitHub with all our changes — especially:
-- `rp_handler.py` (with `runpod.serverless.start()` at module level)
-- `Dockerfile` (CUDA base image + all deps)
-- `requirements.txt`
-- `download_weights.py`
-
-### 1.2 — Create a Network Volume
+### 1.1 — Create a Network Volume
 
 1. **RunPod Console → Storage → Network Volumes → Create**
 2. Name: `longcat-weights`
-3. Region: **same region you'll use for the endpoint**
-4. Size: **100 GB**
+3. Region: **same region you'll use for the pod** (e.g. `US-TX-3`)
+4. Size: **250 GB** (weights are ~200 GB total)
 
-### 1.3 — Download weights to the volume (one-time)
+### 1.2 — Download weights to the volume (one-time)
 
-Spin up a temporary pod to download the HuggingFace models:
+Spin up a temporary pod to download models:
 
 1. **RunPod Console → Pods → Deploy**
-2. Pick any GPU (cheapest available is fine — it's just downloading)
-3. Attach volume `longcat-weights` (mounts at `/runpod-volume`)
-4. Open a terminal
+2. Pick any GPU (cheapest available — it's just downloading)
+3. **Attach volume** `longcat-weights` → mount path: `/workspace`
+4. Template: any PyTorch template (e.g. `RunPod PyTorch 2.x`)
+5. Open a terminal
+
+> **Important:** On RunPod Pods the network volume mounts at `/workspace`.
+> Set `HF_HOME` to the volume so the download cache doesn't fill the container disk.
 
 ```bash
-pip install huggingface_hub
+# Point HF cache to the volume (avoids filling the 20 GB container disk)
+export HF_HOME=/workspace/hf_cache
+mkdir -p /workspace/weights
 
-python -c "
+# Optional: set for faster authenticated downloads
+# export HF_TOKEN="hf_xxxxxxxx"
+
+pip install -q huggingface_hub
+
+# Download LongCat-Video (~80 GB)
+python3 -c "
 from huggingface_hub import snapshot_download
 snapshot_download('meituan-longcat/LongCat-Video',
-                  local_dir='/runpod-volume/weights/LongCat-Video',
-                  local_dir_use_symlinks=False)
-snapshot_download('meituan-longcat/LongCat-Video-Avatar',
-                  local_dir='/runpod-volume/weights/LongCat-Video-Avatar',
-                  local_dir_use_symlinks=False)
-print('Done!')
+                  local_dir='/workspace/weights/LongCat-Video')
+print('Done: LongCat-Video')
 "
+
+# Clean cache between downloads to save disk space
+rm -rf /workspace/hf_cache
+
+# Download LongCat-Video-Avatar (~120 GB)
+export HF_HOME=/workspace/hf_cache
+python3 -c "
+from huggingface_hub import snapshot_download
+snapshot_download('meituan-longcat/LongCat-Video-Avatar',
+                  local_dir='/workspace/weights/LongCat-Video-Avatar')
+print('Done: LongCat-Video-Avatar')
+"
+
+# Final cleanup & verify
+rm -rf /workspace/hf_cache
+du -sh /workspace/weights/*
 ```
 
-Or clone the repo and use the helper script:
-
-```bash
-git clone https://github.com/Nicolepcx/LongCat-Video.git /tmp/repo
-cd /tmp/repo
-python download_weights.py --output_dir /runpod-volume/weights
+Expected output:
 ```
-
-Verify the structure:
-
-```
-/runpod-volume/weights/
-├── LongCat-Video/
-│   ├── tokenizer/
-│   ├── text_encoder/
-│   ├── vae/
-│   └── scheduler/
-└── LongCat-Video-Avatar/
-    ├── avatar_single/
-    ├── chinese-wav2vec2-base/
-    └── vocal_separator/Kim_Vocal_2.onnx
+78G   /workspace/weights/LongCat-Video
+120G  /workspace/weights/LongCat-Video-Avatar
 ```
 
 **Terminate the temporary pod** — the volume persists.
 
-### 1.4 — Create the Serverless Endpoint from GitHub
+### 1.3 — Run on a Pod
+
+1. **RunPod Console → Pods → Deploy**
+2. GPU: **A100 80 GB** (minimum 48 GB VRAM)
+3. **Attach volume** `longcat-weights` → mount path: `/workspace`
+4. Template: `RunPod PyTorch 2.x` (or any CUDA 12.x template)
+5. Open a terminal
+
+```bash
+# Clone the repo
+git clone https://github.com/Nicolepcx/LongCat-Video.git /workspace/LongCat-Video
+cd /workspace/LongCat-Video
+
+# Run the setup script (installs deps, flash-attn, verifies weights)
+chmod +x setup_pod.sh
+./setup_pod.sh
+
+# Run inference with the example files
+torchrun --nproc_per_node=1 run_demo_avatar_single_audio_to_video.py \
+  --base_model_dir /workspace/weights/LongCat-Video \
+  --checkpoint_dir /workspace/weights/LongCat-Video-Avatar \
+  --input_json assets/avatar/single_example_1.json
+```
+
+The setup script handles:
+- System deps (`ffmpeg`, `libsndfile1`)
+- Python requirements
+- `flash-attn` compilation (with automatic SDPA fallback if build fails)
+- Weight verification
+- Import smoke test
+
+### 1.4 — Using custom audio/image
+
+Create a JSON config file (e.g. `my_input.json`):
+
+```json
+{
+    "prompt": "A woman speaking naturally with expressive gestures",
+    "cond_image": "path/to/face.png",
+    "cond_audio": {
+        "person1": "path/to/speech.wav"
+    }
+}
+```
+
+Then run:
+```bash
+torchrun --nproc_per_node=1 run_demo_avatar_single_audio_to_video.py \
+  --base_model_dir /workspace/weights/LongCat-Video \
+  --checkpoint_dir /workspace/weights/LongCat-Video-Avatar \
+  --input_json my_input.json \
+  --stage_1 ai2v
+```
+
+### 1.5 — RunPod Serverless (alternative)
+
+For scale-to-zero behavior, use the serverless endpoint:
 
 1. **RunPod Console → Serverless → New Endpoint**
-2. Click **"Connect GitHub"** → authorize → select `Nicolepcx/LongCat-Video`
-3. RunPod will detect the `Dockerfile` and `runpod.serverless.start()` in `rp_handler.py`
-4. Configure the endpoint:
+2. **Connect GitHub** → select `Nicolepcx/LongCat-Video`
+3. RunPod detects `Dockerfile` + `rp_handler.py` automatically
+4. Configure:
 
 | Setting | Value |
 |---------|-------|
-| **Endpoint name** | `LongCat-Video` |
-| **GPU** | A100 80 GB (or A40 / L40S — 48 GB min) |
+| **GPU** | A100 80 GB |
 | **Network Volume** | `longcat-weights` |
 | **Min Workers** | `0` (scale to zero) |
 | **Max Workers** | `1` |
 | **Idle Timeout** | `300` s |
 | **Execution Timeout** | `900` s |
 | **Flash Boot** | Enabled |
-| **Container Disk** | `20` GB |
-| **Container start command** | `python -u rp_handler.py` |
 
 5. Environment variables:
 
@@ -120,49 +170,41 @@ Verify the structure:
 |----------|-------|
 | `WEIGHTS_DIR` | `/runpod-volume/weights` |
 
+> **Note:** Serverless mounts volumes at `/runpod-volume`, not `/workspace`.
+
 6. Click **Deploy**
 
-RunPod builds the Docker image from your repo in the cloud — no local build needed.
-Note the **Endpoint ID** (e.g. `abc123xyz`) once it's created.
-
-### 1.5 — Test the endpoint
+Test with:
 
 ```bash
-export RUNPOD_API_KEY="rp_xxxxxxxx"
-export ENDPOINT_ID="abc123xyz"
+# Write payload to file (base64 strings are too long for shell args)
+cat > /tmp/test_payload.json << 'EOF'
+{
+  "input": {
+    "audio_base64": "<base64-encoded-audio>",
+    "image_base64": "<base64-encoded-image>",
+    "prompt": "A person speaking naturally",
+    "stage": "ai2v"
+  }
+}
+EOF
 
-# Encode test files
-AUDIO_B64=$(base64 -i test_audio.wav)
-IMAGE_B64=$(base64 -i test_face.png)
-
-# Submit
 curl -s -X POST "https://api.runpod.ai/v2/${ENDPOINT_ID}/run" \
   -H "Authorization: Bearer ${RUNPOD_API_KEY}" \
   -H "Content-Type: application/json" \
-  -d "{
-    \"input\": {
-      \"audio_base64\": \"${AUDIO_B64}\",
-      \"image_base64\": \"${IMAGE_B64}\",
-      \"prompt\": \"A person speaking naturally\",
-      \"stage\": \"ai2v\"
-    }
-  }"
+  -d @/tmp/test_payload.json
 ```
 
-Poll with:
-
-```bash
-JOB_ID="your-job-id-here"
-curl -s "https://api.runpod.ai/v2/${ENDPOINT_ID}/status/${JOB_ID}" \
-  -H "Authorization: Bearer ${RUNPOD_API_KEY}"
-```
+> **Warning:** Serverless cold starts are **very slow** for this model (10-40 min)
+> due to the large weight loading time. A persistent Pod with `setup_pod.sh` is
+> recommended for development and regular use.
 
 ---
 
 ## Part 2: Gradio UI on DigitalOcean
 
-The Gradio app (`app.py`) is a lightweight frontend — no GPU, no torch. It uses
-`Dockerfile.app` which only installs `gradio` and `requests`.
+The Gradio app (`app.py`) is a lightweight frontend — no GPU needed. It base64-encodes
+your audio/image and sends them to the RunPod endpoint.
 
 ### 2.1 — Deploy on DigitalOcean App Platform
 
@@ -175,79 +217,59 @@ The Gradio app (`app.py`) is a lightweight frontend — no GPU, no torch. It use
 | Variable | Value |
 |----------|-------|
 | `RUNPOD_API_KEY` | `rp_xxxxxxxx` |
-| `RUNPOD_ENDPOINT_ID` | `abc123xyz` (from step 1.4) |
+| `RUNPOD_ENDPOINT_ID` | your endpoint ID |
 | `GRADIO_USERNAME` | your login username |
 | `GRADIO_PASSWORD` | a strong password |
 | `PORT` | `7860` |
 
 6. Deploy
 
-You'll get a URL like `https://your-app-xxxxx.ondigitalocean.app`.
-Login with the username/password you set → upload audio + image → get video.
-
-### 2.2 — Test locally first (optional)
+### 2.2 — Test locally (optional)
 
 ```bash
 pip install gradio requests
-
 export RUNPOD_API_KEY="rp_xxxxxxxx"
-export RUNPOD_ENDPOINT_ID="abc123xyz"
+export RUNPOD_ENDPOINT_ID="your-endpoint-id"
 export GRADIO_PASSWORD="testpass"
-
 python app.py
 # Open http://localhost:7860
 ```
 
 ---
 
-## How It All Fits Together
+## Expected Performance
 
-```
-You (browser)
-    │
-    │  Login with username/password
-    ▼
-Gradio on DO ($5/mo)
-    │
-    │  1. Reads your audio + image files
-    │  2. Base64-encodes them
-    │  3. POSTs to RunPod API
-    │  4. Polls for result
-    │  5. Decodes video, shows in browser
-    ▼
-RunPod Serverless (pay-per-second)
-    │
-    │  - Scales from 0 when job arrives (~2-3 min cold start)
-    │  - Loads weights from Network Volume
-    │  - Runs inference (~3-10 min)
-    │  - Returns video as base64
-    │  - Scales back to 0 after idle timeout
-    ▼
-Network Volume ($7/mo for 100 GB)
-    │
-    └── Stores model weights permanently
-```
-
-### Monthly cost when not in use
-
-| Component | Cost |
-|-----------|------|
-| RunPod workers (scaled to zero) | $0.00 |
-| Network Volume (100 GB) | ~$7.00 |
-| DigitalOcean App (Basic) | ~$5.00 |
-| **Total idle** | **~$12/mo** |
-
-### Cost per video
-
-| Phase | Duration | Cost (A100 80GB) |
-|-------|----------|-------------------|
-| Cold start (if scaled to zero) | ~2-3 min | ~$0.14-0.22 |
-| Inference (1 segment, 480p) | ~3-5 min | ~$0.22-0.36 |
-| **Total per video** | ~5-8 min | **~$0.36-0.58** |
+| Phase | Duration | Notes |
+|-------|----------|-------|
+| `setup_pod.sh` (first run) | ~20-30 min | Mostly flash-attn compilation |
+| `setup_pod.sh` (re-run) | ~2 min | Deps already cached |
+| Model loading | ~1-2 min | Weights loaded from network volume |
+| Audio separation | ~1 min | Vocal extraction with ONNX |
+| Denoising (50 steps, 480p) | ~15-17 min | ~20s per step on A100 80 GB |
+| **Total inference** | **~17-20 min** | Single segment |
 
 ---
 
-## API Reference
+## Cost Estimates
+
+### Monthly (idle)
+
+| Component | Cost |
+|-----------|------|
+| RunPod Pod (stopped) | $0.00 |
+| Network Volume (250 GB) | ~$17.50 |
+| DigitalOcean App (Basic) | ~$5.00 |
+| **Total idle** | **~$22.50/mo** |
+
+### Per video (A100 80 GB @ ~$1.10/hr)
+
+| Phase | Duration | Cost |
+|-------|----------|------|
+| Inference (1 segment, 480p) | ~17-20 min | ~$0.31-0.37 |
+
+---
+
+## API Reference (Serverless)
 
 ### Input (`job["input"]`)
 
@@ -277,11 +299,12 @@ Network Volume ($7/mo for 100 GB)
 
 | Problem | Fix |
 |---------|-----|
-| RunPod says "Could not find runpod.serverless.start()" | Make sure `rp_handler.py` has `runpod.serverless.start()` at module level (not inside `if __name__`) and the code is pushed to the default branch |
-| Cold start too slow | Enable Flash Boot; verify volume is in the same region |
+| `flash_attn` ABI mismatch / undefined symbol | Run `setup_pod.sh` — it auto-detects and falls back to PyTorch SDPA |
+| `ffmpeg: not found` | Run `apt-get install -y ffmpeg` or re-run `setup_pod.sh` |
+| `No space left on device` during weight download | Set `HF_HOME` to the volume; download models one at a time |
+| Volume not mounted | Pods use `/workspace`, Serverless uses `/runpod-volume` |
+| Serverless cold start > 30 min | Use a Pod instead; Serverless is impractical for this model size |
 | OOM | Use A100 80 GB; lower resolution to 480p; set segments to 1 |
-| "No vocal detected" | Audio may not contain speech — try 16 kHz mono WAV |
-| Gradio shows "app is unprotected" | Set `GRADIO_PASSWORD` environment variable |
 
 ---
 
@@ -289,11 +312,12 @@ Network Volume ($7/mo for 100 GB)
 
 | File | What it does |
 |------|-------------|
+| `setup_pod.sh` | One-command pod setup (deps, flash-attn, verification) |
 | `rp_handler.py` | RunPod serverless worker (GPU) |
-| `Dockerfile` | Docker image for the GPU worker (built by RunPod from GitHub) |
+| `Dockerfile` | Docker image for the GPU worker |
 | `app.py` | Gradio UI with password auth (no GPU) |
-| `Dockerfile.app` | Docker image for the Gradio UI (for DigitalOcean) |
+| `Dockerfile.app` | Docker image for the Gradio UI |
 | `requirements.txt` | Python deps for the GPU worker |
-| `requirements-app.txt` | Python deps for the Gradio UI (`gradio`, `requests`) |
-| `download_weights.py` | One-time weight download to network volume |
+| `requirements-app.txt` | Python deps for the Gradio UI |
+| `download_weights.py` | Programmatic weight download helper |
 | `.dockerignore` | Keeps Docker images lean |
