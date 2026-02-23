@@ -14,12 +14,43 @@ WEIGHTS_DIR          Root directory that contains both LongCat-Video/ and
 OUTPUT_DIR           Where generated videos are written.  (default: /tmp/outputs)
 """
 
+# === EARLY DIAGNOSTICS =====================================================
 import os
-import io
 import sys
+import time
+
+print("[rp_handler] ======== STARTING UP ========", flush=True)
+print(f"[rp_handler] Python {sys.version}", flush=True)
+print(f"[rp_handler] CWD: {os.getcwd()}", flush=True)
+print(f"[rp_handler] WEIGHTS_DIR env: {os.environ.get('WEIGHTS_DIR', '<not set, will use default>')}", flush=True)
+
+# Check volume mount
+if os.path.exists("/runpod-volume"):
+    try:
+        contents = os.listdir("/runpod-volume")
+        print(f"[rp_handler] /runpod-volume exists, contents: {contents}", flush=True)
+    except Exception as e:
+        print(f"[rp_handler] /runpod-volume exists but cannot list: {e}", flush=True)
+else:
+    print("[rp_handler] WARNING: /runpod-volume does NOT exist!", flush=True)
+    # List what's in /
+    print(f"[rp_handler] Root contents: {os.listdir('/')}", flush=True)
+
+weights_dir = os.environ.get("WEIGHTS_DIR", "/runpod-volume/weights")
+if os.path.exists(weights_dir):
+    try:
+        contents = os.listdir(weights_dir)
+        print(f"[rp_handler] Weights dir ({weights_dir}) contents: {contents}", flush=True)
+    except Exception as e:
+        print(f"[rp_handler] Weights dir exists but cannot list: {e}", flush=True)
+else:
+    print(f"[rp_handler] WARNING: Weights dir {weights_dir} does NOT exist!", flush=True)
+
+# === IMPORTS ===============================================================
+print("[rp_handler] Importing standard libraries …", flush=True)
+import io
 import json
 import math
-import time
 import base64
 import random
 import shutil
@@ -28,12 +59,33 @@ import datetime
 import traceback
 from pathlib import Path
 
-import runpod
+print("[rp_handler] Importing runpod …", flush=True)
+try:
+    import runpod
+    print(f"[rp_handler] runpod version: {runpod.__version__}", flush=True)
+except Exception as e:
+    print(f"[rp_handler] FATAL: Cannot import runpod: {e}", flush=True)
+    traceback.print_exc()
+    sys.exit(1)
 
-import numpy as np
-import PIL.Image
-import torch
-import torch.distributed as dist
+print("[rp_handler] Importing numpy, PIL, torch …", flush=True)
+try:
+    import numpy as np
+    import PIL.Image
+    import torch
+    import torch.distributed as dist
+    print(f"[rp_handler] torch {torch.__version__}, CUDA available: {torch.cuda.is_available()}", flush=True)
+    if torch.cuda.is_available():
+        print(f"[rp_handler] CUDA device count: {torch.cuda.device_count()}", flush=True)
+        for i in range(torch.cuda.device_count()):
+            print(f"[rp_handler]   GPU {i}: {torch.cuda.get_device_name(i)} "
+                  f"({torch.cuda.get_device_properties(i).total_mem / 1e9:.1f} GB)", flush=True)
+    else:
+        print("[rp_handler] WARNING: CUDA is NOT available!", flush=True)
+except Exception as e:
+    print(f"[rp_handler] FATAL: Cannot import torch/numpy/PIL: {e}", flush=True)
+    traceback.print_exc()
+    sys.exit(1)
 
 # ---------------------------------------------------------------------------
 # Resolve weight paths from env
@@ -44,39 +96,67 @@ AVATAR_WEIGHTS_DIR = os.path.join(WEIGHTS_DIR, "LongCat-Video-Avatar")
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/tmp/outputs")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+print(f"[rp_handler] BASE_MODEL_DIR   = {BASE_MODEL_DIR} (exists: {os.path.exists(BASE_MODEL_DIR)})", flush=True)
+print(f"[rp_handler] AVATAR_WEIGHTS_DIR = {AVATAR_WEIGHTS_DIR} (exists: {os.path.exists(AVATAR_WEIGHTS_DIR)})", flush=True)
+
 # ---------------------------------------------------------------------------
 # Bootstrap torch.distributed for single-GPU (avoids needing torchrun)
 # ---------------------------------------------------------------------------
+print("[rp_handler] Initializing torch.distributed …", flush=True)
 os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
 os.environ.setdefault("MASTER_PORT", "29500")
 os.environ.setdefault("RANK", "0")
 os.environ.setdefault("WORLD_SIZE", "1")
 os.environ.setdefault("LOCAL_RANK", "0")
 
-if not dist.is_initialized():
-    dist.init_process_group(
-        backend="nccl",
-        timeout=datetime.timedelta(seconds=3600),
-    )
+try:
+    if not dist.is_initialized():
+        dist.init_process_group(
+            backend="nccl",
+            timeout=datetime.timedelta(seconds=3600),
+        )
+    print("[rp_handler] torch.distributed initialized (nccl) OK", flush=True)
+except Exception as e:
+    print(f"[rp_handler] NCCL init failed: {e}. Trying gloo …", flush=True)
+    try:
+        if not dist.is_initialized():
+            dist.init_process_group(
+                backend="gloo",
+                timeout=datetime.timedelta(seconds=3600),
+            )
+        print("[rp_handler] torch.distributed initialized (gloo) OK", flush=True)
+    except Exception as e2:
+        print(f"[rp_handler] FATAL: torch.distributed init failed with both nccl and gloo: {e2}", flush=True)
+        traceback.print_exc()
+        sys.exit(1)
 
 LOCAL_RANK = int(os.environ.get("LOCAL_RANK", 0))
-torch.cuda.set_device(LOCAL_RANK)
+if torch.cuda.is_available():
+    torch.cuda.set_device(LOCAL_RANK)
+    print(f"[rp_handler] Using CUDA device {LOCAL_RANK}", flush=True)
 
 # ---------------------------------------------------------------------------
 # Imports that depend on torch / project modules
 # ---------------------------------------------------------------------------
-import librosa
-from transformers import AutoTokenizer, UMT5EncoderModel, Wav2Vec2FeatureExtractor
-from diffusers.utils import load_image
-from audio_separator.separator import Separator
+print("[rp_handler] Importing project modules …", flush=True)
+try:
+    import librosa
+    from transformers import AutoTokenizer, UMT5EncoderModel, Wav2Vec2FeatureExtractor
+    from diffusers.utils import load_image
+    from audio_separator.separator import Separator
 
-from longcat_video.pipeline_longcat_video_avatar import LongCatVideoAvatarPipeline
-from longcat_video.modules.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
-from longcat_video.modules.autoencoder_kl_wan import AutoencoderKLWan
-from longcat_video.modules.avatar.longcat_video_dit_avatar import LongCatVideoAvatarTransformer3DModel
-from longcat_video.context_parallel import context_parallel_util
-from longcat_video.audio_process.wav2vec2 import Wav2Vec2ModelWrapper
-from longcat_video.audio_process.torch_utils import save_video_ffmpeg
+    from longcat_video.pipeline_longcat_video_avatar import LongCatVideoAvatarPipeline
+    from longcat_video.modules.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
+    from longcat_video.modules.autoencoder_kl_wan import AutoencoderKLWan
+    from longcat_video.modules.avatar.longcat_video_dit_avatar import LongCatVideoAvatarTransformer3DModel
+    from longcat_video.context_parallel import context_parallel_util
+    from longcat_video.audio_process.wav2vec2 import Wav2Vec2ModelWrapper
+    from longcat_video.audio_process.torch_utils import save_video_ffmpeg
+    print("[rp_handler] All project modules imported OK", flush=True)
+except Exception as e:
+    print(f"[rp_handler] FATAL: Cannot import project modules: {e}", flush=True)
+    traceback.print_exc()
+    sys.exit(1)
 
 # ---------------------------------------------------------------------------
 # Helper utilities
@@ -107,64 +187,86 @@ def extract_vocal_from_speech(source_path, target_path, vocal_separator, audio_o
 # ---------------------------------------------------------------------------
 # Model loading (runs once on cold start)
 # ---------------------------------------------------------------------------
-print("[rp_handler] Loading models …")
-_load_start = time.time()
+pipe = None  # Will be set if loading succeeds
 
-context_parallel_util.init_context_parallel(
-    context_parallel_size=1,
-    global_rank=dist.get_rank(),
-    world_size=dist.get_world_size(),
-)
-cp_split_hw = context_parallel_util.get_optimal_split(1)
+try:
+    print("[rp_handler] Loading models …", flush=True)
+    _load_start = time.time()
 
-tokenizer = AutoTokenizer.from_pretrained(
-    BASE_MODEL_DIR, subfolder="tokenizer", torch_dtype=torch.bfloat16
-)
-text_encoder = UMT5EncoderModel.from_pretrained(
-    BASE_MODEL_DIR, subfolder="text_encoder", torch_dtype=torch.bfloat16
-)
-vae = AutoencoderKLWan.from_pretrained(
-    BASE_MODEL_DIR, subfolder="vae", torch_dtype=torch.bfloat16
-)
-scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-    BASE_MODEL_DIR, subfolder="scheduler", torch_dtype=torch.bfloat16
-)
-dit = LongCatVideoAvatarTransformer3DModel.from_pretrained(
-    AVATAR_WEIGHTS_DIR, subfolder="avatar_single",
-    cp_split_hw=cp_split_hw, torch_dtype=torch.bfloat16,
-)
+    print("[rp_handler]   init_context_parallel …", flush=True)
+    context_parallel_util.init_context_parallel(
+        context_parallel_size=1,
+        global_rank=dist.get_rank(),
+        world_size=dist.get_world_size(),
+    )
+    cp_split_hw = context_parallel_util.get_optimal_split(1)
 
-wav2vec_path = os.path.join(AVATAR_WEIGHTS_DIR, "chinese-wav2vec2-base")
-audio_encoder = Wav2Vec2ModelWrapper(wav2vec_path).to(LOCAL_RANK)
-audio_encoder.feature_extractor._freeze_parameters()
-wav2vec_feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(
-    wav2vec_path, local_files_only=True
-)
+    print(f"[rp_handler]   Loading tokenizer from {BASE_MODEL_DIR}/tokenizer …", flush=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        BASE_MODEL_DIR, subfolder="tokenizer", torch_dtype=torch.bfloat16
+    )
 
-# Vocal separator
-vocal_separator_path = os.path.join(AVATAR_WEIGHTS_DIR, "vocal_separator/Kim_Vocal_2.onnx")
-audio_output_dir_temp = Path("/tmp/audio_temp")
-audio_output_dir_temp.mkdir(parents=True, exist_ok=True)
-vocal_separator = Separator(
-    output_dir=audio_output_dir_temp / "vocals",
-    output_single_stem="vocals",
-    model_file_dir=os.path.dirname(vocal_separator_path),
-)
-vocal_separator.load_model(os.path.basename(vocal_separator_path))
+    print(f"[rp_handler]   Loading text_encoder from {BASE_MODEL_DIR}/text_encoder …", flush=True)
+    text_encoder = UMT5EncoderModel.from_pretrained(
+        BASE_MODEL_DIR, subfolder="text_encoder", torch_dtype=torch.bfloat16
+    )
 
-# Build pipeline
-pipe = LongCatVideoAvatarPipeline(
-    tokenizer=tokenizer,
-    text_encoder=text_encoder,
-    vae=vae,
-    scheduler=scheduler,
-    dit=dit,
-    audio_encoder=audio_encoder,
-    wav2vec_feature_extractor=wav2vec_feature_extractor,
-)
-pipe.to(LOCAL_RANK)
+    print(f"[rp_handler]   Loading vae from {BASE_MODEL_DIR}/vae …", flush=True)
+    vae = AutoencoderKLWan.from_pretrained(
+        BASE_MODEL_DIR, subfolder="vae", torch_dtype=torch.bfloat16
+    )
 
-print(f"[rp_handler] Models loaded in {time.time() - _load_start:.1f}s")
+    print(f"[rp_handler]   Loading scheduler from {BASE_MODEL_DIR}/scheduler …", flush=True)
+    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+        BASE_MODEL_DIR, subfolder="scheduler", torch_dtype=torch.bfloat16
+    )
+
+    print(f"[rp_handler]   Loading DiT from {AVATAR_WEIGHTS_DIR}/avatar_single …", flush=True)
+    dit = LongCatVideoAvatarTransformer3DModel.from_pretrained(
+        AVATAR_WEIGHTS_DIR, subfolder="avatar_single",
+        cp_split_hw=cp_split_hw, torch_dtype=torch.bfloat16,
+    )
+
+    wav2vec_path = os.path.join(AVATAR_WEIGHTS_DIR, "chinese-wav2vec2-base")
+    print(f"[rp_handler]   Loading wav2vec from {wav2vec_path} …", flush=True)
+    audio_encoder = Wav2Vec2ModelWrapper(wav2vec_path).to(LOCAL_RANK)
+    audio_encoder.feature_extractor._freeze_parameters()
+    wav2vec_feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(
+        wav2vec_path, local_files_only=True
+    )
+
+    # Vocal separator
+    vocal_separator_path = os.path.join(AVATAR_WEIGHTS_DIR, "vocal_separator/Kim_Vocal_2.onnx")
+    print(f"[rp_handler]   Loading vocal separator from {vocal_separator_path} …", flush=True)
+    audio_output_dir_temp = Path("/tmp/audio_temp")
+    audio_output_dir_temp.mkdir(parents=True, exist_ok=True)
+    vocal_separator = Separator(
+        output_dir=audio_output_dir_temp / "vocals",
+        output_single_stem="vocals",
+        model_file_dir=os.path.dirname(vocal_separator_path),
+    )
+    vocal_separator.load_model(os.path.basename(vocal_separator_path))
+
+    # Build pipeline
+    print("[rp_handler]   Building pipeline …", flush=True)
+    pipe = LongCatVideoAvatarPipeline(
+        tokenizer=tokenizer,
+        text_encoder=text_encoder,
+        vae=vae,
+        scheduler=scheduler,
+        dit=dit,
+        audio_encoder=audio_encoder,
+        wav2vec_feature_extractor=wav2vec_feature_extractor,
+    )
+    pipe.to(LOCAL_RANK)
+
+    print(f"[rp_handler] Models loaded in {time.time() - _load_start:.1f}s", flush=True)
+
+except Exception as e:
+    print(f"[rp_handler] FATAL: Model loading failed: {e}", flush=True)
+    traceback.print_exc()
+    # Don't sys.exit — let RunPod start so it can report errors per-job
+    pipe = None
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +287,9 @@ def run_inference(
     seed: int = 42,
 ) -> str:
     """Run avatar inference and return path to the generated .mp4 file."""
+
+    if pipe is None:
+        raise RuntimeError("Models failed to load during cold start — check startup logs")
 
     if negative_prompt is None:
         negative_prompt = (
@@ -459,12 +564,12 @@ def handler(job):
             return {"error": "ai2v stage requires image_base64"}
 
         # --- Decode input files from base64 ---
-        print("[handler] Decoding input files …")
+        print("[handler] Decoding input files …", flush=True)
         audio_tmp_path = _resolve_input_file(inp, "audio_base64", ".wav")
         image_tmp_path = _resolve_input_file(inp, "image_base64", ".png")
 
         # --- Run inference ---
-        print("[handler] Starting inference …")
+        print("[handler] Starting inference …", flush=True)
         t0 = time.time()
         video_path = run_inference(
             audio_path=audio_tmp_path,
@@ -479,7 +584,7 @@ def handler(job):
             num_segments=inp.get("num_segments", 1),
             seed=inp.get("seed", 42),
         )
-        print(f"[handler] Inference completed in {time.time() - t0:.1f}s")
+        print(f"[handler] Inference completed in {time.time() - t0:.1f}s", flush=True)
 
         # --- Encode result as base64 ---
         with open(video_path, "rb") as f:
@@ -505,4 +610,5 @@ def handler(job):
 # ---------------------------------------------------------------------------
 # Entry point — must be at module level for RunPod's GitHub scanner to detect
 # ---------------------------------------------------------------------------
+print("[rp_handler] Starting RunPod serverless listener …", flush=True)
 runpod.serverless.start({"handler": handler})
