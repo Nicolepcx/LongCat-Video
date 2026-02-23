@@ -254,9 +254,18 @@ def build_ui():
 # Entry point
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    # Password protection via environment variables
+    username = os.environ.get("GRADIO_USERNAME", "admin")
+    password = os.environ.get("GRADIO_PASSWORD")
+
+    auth = (username, password) if password else None
+    if not auth:
+        print("WARNING: No GRADIO_PASSWORD set — app is unprotected!")
+
     demo = build_ui()
     demo.launch(
         server_name="0.0.0.0",
         server_port=int(os.environ.get("PORT", 7860)),
         share=False,
+        auth=auth,
     )

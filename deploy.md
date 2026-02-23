@@ -1,97 +1,62 @@
-# Deploying LongCat-Video Avatar on RunPod (Serverless)
+# Deploying LongCat-Video Avatar
 
-End-to-end guide: build the Docker image, set up model weights on a RunPod
-Network Volume, create a serverless endpoint that scales to zero, and run
-the Gradio UI to upload audio + image and get a video back.
+Two things to deploy:
+
+1. **RunPod Serverless endpoint** — the GPU worker that runs inference (scales to zero)
+2. **Gradio UI on DigitalOcean** — password-protected frontend to upload audio + image
+
+No local Docker builds needed. RunPod builds from GitHub, DO builds from `Dockerfile.app`.
 
 ---
 
 ## Architecture
 
 ```
-┌───────────────────────────┐
-│   Gradio UI  (app.py)     │   ← No GPU — runs locally or on a $5/mo host
-│   Upload audio + image    │
-└────────────┬──────────────┘
-             │  audio & image sent as base64
-             │  via RunPod REST API
-             ▼
-┌───────────────────────────┐       ┌──────────────────────────────┐
-│  RunPod Serverless        │◄─────►│  Network Volume              │
-│  Endpoint                 │       │  /runpod-volume/weights/      │
-│  (scales 0 → N GPUs)     │       │   ├── LongCat-Video/         │
-│                           │       │   └── LongCat-Video-Avatar/  │
-│  Returns video as base64  │       └──────────────────────────────┘
-└───────────────────────────┘
-```
-
-**No S3, no file hosting** — audio and image files are encoded as base64
-and sent directly in the job payload. The generated video comes back as
-base64 in the response.
-
----
-
-## Prerequisites
-
-| Tool | Purpose |
-|------|---------|
-| [Docker](https://docs.docker.com/get-docker/) | Build the worker image |
-| [RunPod account](https://runpod.io) | Serverless GPU + network volume |
-| Docker Hub account (or GHCR / ECR) | Push the built image |
-| HuggingFace account | Download model weights |
-
-Create a RunPod API key at **RunPod Console → Settings → API Keys**.
-
----
-
-## Step 1 — Build & Push the Docker Image
-
-```bash
-# Build (flash-attn compilation takes ~10-20 min)
-docker build -t <your-dockerhub-user>/longcat-video-avatar:latest .
-
-# Push
-docker push <your-dockerhub-user>/longcat-video-avatar:latest
-```
-
-**Optional local test** (needs an NVIDIA GPU + downloaded weights):
-
-```bash
-docker run --gpus all \
-  -v /path/to/weights:/runpod-volume/weights \
-  -p 8000:8000 \
-  <your-dockerhub-user>/longcat-video-avatar:latest
+┌────────────────────────────────┐
+│  Gradio UI  (DigitalOcean)     │  ← $5/mo, password-protected
+│  Upload audio + image          │
+└───────────────┬────────────────┘
+                │  base64 payload via RunPod API
+                ▼
+┌────────────────────────────────┐      ┌─────────────────────────────┐
+│  RunPod Serverless Endpoint    │◄────►│  Network Volume             │
+│  Built from GitHub repo        │      │  /runpod-volume/weights/    │
+│  Scales 0 → N GPUs             │      │  ├── LongCat-Video/        │
+│  Returns video as base64       │      │  └── LongCat-Video-Avatar/ │
+└────────────────────────────────┘      └─────────────────────────────┘
 ```
 
 ---
 
-## Step 2 — Create a RunPod Network Volume
+## Part 1: RunPod Serverless Endpoint
+
+### 1.1 — Push repo to GitHub
+
+Make sure the repo is pushed to GitHub with all our changes — especially:
+- `rp_handler.py` (with `runpod.serverless.start()` at module level)
+- `Dockerfile` (CUDA base image + all deps)
+- `requirements.txt`
+- `download_weights.py`
+
+### 1.2 — Create a Network Volume
 
 1. **RunPod Console → Storage → Network Volumes → Create**
 2. Name: `longcat-weights`
-3. Region: **same region** as the endpoint you'll create
-4. Size: **100 GB** (weights ≈ 60 GB + headroom)
+3. Region: **same region you'll use for the endpoint**
+4. Size: **100 GB**
 
----
+### 1.3 — Download weights to the volume (one-time)
 
-## Step 3 — Download Weights onto the Volume
-
-Spin up a temporary pod with the volume attached:
+Spin up a temporary pod to download the HuggingFace models:
 
 1. **RunPod Console → Pods → Deploy**
-2. Pick any GPU (or even CPU — it's just downloading)
+2. Pick any GPU (cheapest available is fine — it's just downloading)
 3. Attach volume `longcat-weights` (mounts at `/runpod-volume`)
-4. Open a terminal in the pod
+4. Open a terminal
 
 ```bash
 pip install huggingface_hub
 
-# Option A: clone repo and use the helper script
-git clone https://github.com/<your-user>/LongCat-Video.git /tmp/repo
-cd /tmp/repo
-python download_weights.py --output_dir /runpod-volume/weights
-
-# Option B: quick inline download
 python -c "
 from huggingface_hub import snapshot_download
 snapshot_download('meituan-longcat/LongCat-Video',
@@ -100,7 +65,16 @@ snapshot_download('meituan-longcat/LongCat-Video',
 snapshot_download('meituan-longcat/LongCat-Video-Avatar',
                   local_dir='/runpod-volume/weights/LongCat-Video-Avatar',
                   local_dir_use_symlinks=False)
+print('Done!')
 "
+```
+
+Or clone the repo and use the helper script:
+
+```bash
+git clone https://github.com/Nicolepcx/LongCat-Video.git /tmp/repo
+cd /tmp/repo
+python download_weights.py --output_dir /runpod-volume/weights
 ```
 
 Verify the structure:
@@ -118,79 +92,51 @@ Verify the structure:
     └── vocal_separator/Kim_Vocal_2.onnx
 ```
 
-**Terminate the temporary pod** — the volume persists on its own.
+**Terminate the temporary pod** — the volume persists.
 
----
+### 1.4 — Create the Serverless Endpoint from GitHub
 
-## Step 4 — Create the Serverless Endpoint
-
-1. **RunPod Console → Serverless → Endpoints → New Endpoint**
-2. Configure:
+1. **RunPod Console → Serverless → New Endpoint**
+2. Click **"Connect GitHub"** → authorize → select `Nicolepcx/LongCat-Video`
+3. RunPod will detect the `Dockerfile` and `runpod.serverless.start()` in `rp_handler.py`
+4. Configure the endpoint:
 
 | Setting | Value |
 |---------|-------|
-| **Name** | `longcat-avatar` |
-| **Docker Image** | `<your-dockerhub-user>/longcat-video-avatar:latest` |
-| **GPU Type** | A100 80 GB (recommended) or A40 / L40S (48 GB min) |
+| **Endpoint name** | `LongCat-Video` |
+| **GPU** | A100 80 GB (or A40 / L40S — 48 GB min) |
 | **Network Volume** | `longcat-weights` |
-| **Min Workers** | `0` ← scale to zero |
-| **Max Workers** | `1` (or more for concurrency) |
-| **Idle Timeout** | `300` s (5 min) |
-| **Execution Timeout** | `900` s (15 min) |
+| **Min Workers** | `0` (scale to zero) |
+| **Max Workers** | `1` |
+| **Idle Timeout** | `300` s |
+| **Execution Timeout** | `900` s |
 | **Flash Boot** | Enabled |
+| **Container Disk** | `20` GB |
+| **Container start command** | `python -u rp_handler.py` |
 
-3. Click **Create Endpoint**
-4. Note down the **Endpoint ID** (e.g. `abc123xyz`)
+5. Environment variables:
 
----
+| Variable | Value |
+|----------|-------|
+| `WEIGHTS_DIR` | `/runpod-volume/weights` |
 
-## Step 5 — Run the Gradio UI
+6. Click **Deploy**
 
-The Gradio app (`app.py`) needs only `gradio` and `requests` — no GPU,
-no torch, no CUDA. Run it anywhere.
+RunPod builds the Docker image from your repo in the cloud — no local build needed.
+Note the **Endpoint ID** (e.g. `abc123xyz`) once it's created.
 
-```bash
-pip install gradio requests
-
-export RUNPOD_API_KEY="rp_xxxxxxxx"
-export RUNPOD_ENDPOINT_ID="abc123xyz"
-
-python app.py
-```
-
-Open **http://localhost:7860** → upload audio + image → click Generate → get video.
-
-### Deploy the UI on a cheap host
-
-The Gradio app is stateless and tiny. Any of these work:
-
-| Platform | Cost | Run command |
-|----------|------|-------------|
-| **Local** | free | `python app.py` |
-| **DigitalOcean App Platform** | ~$5/mo | Set env vars, run `python app.py` |
-| **Railway** | ~$5/mo | Same |
-| **Fly.io** | ~$3/mo | Same |
-| **Hugging Face Spaces** | free | Push repo, set secrets |
-
-Set `RUNPOD_API_KEY` and `RUNPOD_ENDPOINT_ID` as environment variables
-on whichever platform you choose.
-
----
-
-## Step 6 — Test via curl / Python (without Gradio)
-
-### curl
+### 1.5 — Test the endpoint
 
 ```bash
 export RUNPOD_API_KEY="rp_xxxxxxxx"
 export ENDPOINT_ID="abc123xyz"
 
-# Encode files
-AUDIO_B64=$(base64 -i speech.wav)
-IMAGE_B64=$(base64 -i face.png)
+# Encode test files
+AUDIO_B64=$(base64 -i test_audio.wav)
+IMAGE_B64=$(base64 -i test_face.png)
 
-# Submit job
-JOB_ID=$(curl -s -X POST "https://api.runpod.ai/v2/${ENDPOINT_ID}/run" \
+# Submit
+curl -s -X POST "https://api.runpod.ai/v2/${ENDPOINT_ID}/run" \
   -H "Authorization: Bearer ${RUNPOD_API_KEY}" \
   -H "Content-Type: application/json" \
   -d "{
@@ -200,106 +146,104 @@ JOB_ID=$(curl -s -X POST "https://api.runpod.ai/v2/${ENDPOINT_ID}/run" \
       \"prompt\": \"A person speaking naturally\",
       \"stage\": \"ai2v\"
     }
-  }" | python -c "import sys,json; print(json.load(sys.stdin)['id'])")
-
-echo "Job submitted: ${JOB_ID}"
-
-# Poll until done
-while true; do
-  STATUS=$(curl -s "https://api.runpod.ai/v2/${ENDPOINT_ID}/status/${JOB_ID}" \
-    -H "Authorization: Bearer ${RUNPOD_API_KEY}" \
-    | python -c "import sys,json; print(json.load(sys.stdin)['status'])")
-  echo "Status: ${STATUS}"
-  [ "$STATUS" = "COMPLETED" ] && break
-  [ "$STATUS" = "FAILED" ] && echo "FAILED" && exit 1
-  sleep 5
-done
-
-# Download result
-curl -s "https://api.runpod.ai/v2/${ENDPOINT_ID}/status/${JOB_ID}" \
-  -H "Authorization: Bearer ${RUNPOD_API_KEY}" \
-  | python -c "
-import sys, json, base64
-data = json.load(sys.stdin)
-video = base64.b64decode(data['output']['video_base64'])
-with open('output.mp4', 'wb') as f:
-    f.write(video)
-print(f'Saved output.mp4 ({len(video):,} bytes)')
-"
+  }"
 ```
 
-### Python
+Poll with:
 
-```python
-import base64, time, requests
-
-API_KEY = "rp_xxxxxxxx"
-ENDPOINT_ID = "abc123xyz"
-BASE = f"https://api.runpod.ai/v2/{ENDPOINT_ID}"
-HEADERS = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
-
-# Encode files
-with open("speech.wav", "rb") as f:
-    audio_b64 = base64.b64encode(f.read()).decode()
-with open("face.png", "rb") as f:
-    image_b64 = base64.b64encode(f.read()).decode()
-
-# Submit
-resp = requests.post(f"{BASE}/run", headers=HEADERS, json={"input": {
-    "audio_base64": audio_b64,
-    "image_base64": image_b64,
-    "prompt": "A person speaking naturally",
-    "stage": "ai2v",
-}})
-job_id = resp.json()["id"]
-print(f"Job: {job_id}")
-
-# Poll
-while True:
-    r = requests.get(f"{BASE}/status/{job_id}", headers=HEADERS).json()
-    print(f"  {r['status']}")
-    if r["status"] == "COMPLETED":
-        break
-    if r["status"] == "FAILED":
-        raise RuntimeError(r)
-    time.sleep(5)
-
-# Save video
-video = base64.b64decode(r["output"]["video_base64"])
-with open("output.mp4", "wb") as f:
-    f.write(video)
-print(f"Saved output.mp4 ({len(video):,} bytes)")
+```bash
+JOB_ID="your-job-id-here"
+curl -s "https://api.runpod.ai/v2/${ENDPOINT_ID}/status/${JOB_ID}" \
+  -H "Authorization: Bearer ${RUNPOD_API_KEY}"
 ```
 
 ---
 
-## How Scale-to-Zero Works
+## Part 2: Gradio UI on DigitalOcean
+
+The Gradio app (`app.py`) is a lightweight frontend — no GPU, no torch. It uses
+`Dockerfile.app` which only installs `gradio` and `requests`.
+
+### 2.1 — Deploy on DigitalOcean App Platform
+
+1. **DigitalOcean Console → App Platform → Create App**
+2. **Source:** GitHub → select `Nicolepcx/LongCat-Video`
+3. **Dockerfile path:** `Dockerfile.app`
+4. **Instance type:** Basic ($5/mo)
+5. **Environment variables:**
+
+| Variable | Value |
+|----------|-------|
+| `RUNPOD_API_KEY` | `rp_xxxxxxxx` |
+| `RUNPOD_ENDPOINT_ID` | `abc123xyz` (from step 1.4) |
+| `GRADIO_USERNAME` | your login username |
+| `GRADIO_PASSWORD` | a strong password |
+| `PORT` | `7860` |
+
+6. Deploy
+
+You'll get a URL like `https://your-app-xxxxx.ondigitalocean.app`.
+Login with the username/password you set → upload audio + image → get video.
+
+### 2.2 — Test locally first (optional)
+
+```bash
+pip install gradio requests
+
+export RUNPOD_API_KEY="rp_xxxxxxxx"
+export RUNPOD_ENDPOINT_ID="abc123xyz"
+export GRADIO_PASSWORD="testpass"
+
+python app.py
+# Open http://localhost:7860
+```
+
+---
+
+## How It All Fits Together
 
 ```
-Job arrives    Worker starts    Inference        Worker idle      Worker stops
-               (cold ~2-3 min)  (~3-10 min)      (5 min timeout)
-    │              │                │                │                │
-    ▼              ▼                ▼                ▼                ▼
-   QUEUE ──────► RUNNING ───────► IDLE ──────────► ZERO ────────────►
-    $0/sec       $X.XX/sec       $X.XX/sec         $0/sec
+You (browser)
+    │
+    │  Login with username/password
+    ▼
+Gradio on DO ($5/mo)
+    │
+    │  1. Reads your audio + image files
+    │  2. Base64-encodes them
+    │  3. POSTs to RunPod API
+    │  4. Polls for result
+    │  5. Decodes video, shows in browser
+    ▼
+RunPod Serverless (pay-per-second)
+    │
+    │  - Scales from 0 when job arrives (~2-3 min cold start)
+    │  - Loads weights from Network Volume
+    │  - Runs inference (~3-10 min)
+    │  - Returns video as base64
+    │  - Scales back to 0 after idle timeout
+    ▼
+Network Volume ($7/mo for 100 GB)
+    │
+    └── Stores model weights permanently
 ```
 
-- **Min workers = 0** → no cost when nobody is using it
-- **Idle timeout = 5 min** → worker stays warm for quick follow-ups
-- **Flash Boot** → container image is cached, so cold starts are as fast as
-  possible (model loading from network volume dominates at ~2-3 min)
-- **Network volume** → weights are pre-loaded, not downloaded each time
+### Monthly cost when not in use
 
-**Cost per video** (A100 80 GB ≈ $0.0012/sec):
+| Component | Cost |
+|-----------|------|
+| RunPod workers (scaled to zero) | $0.00 |
+| Network Volume (100 GB) | ~$7.00 |
+| DigitalOcean App (Basic) | ~$5.00 |
+| **Total idle** | **~$12/mo** |
 
-| Phase | Duration | Cost |
-|-------|----------|------|
-| Cold start (model loading) | ~2-3 min | ~$0.14-0.22 |
+### Cost per video
+
+| Phase | Duration | Cost (A100 80GB) |
+|-------|----------|-------------------|
+| Cold start (if scaled to zero) | ~2-3 min | ~$0.14-0.22 |
 | Inference (1 segment, 480p) | ~3-5 min | ~$0.22-0.36 |
-| **Total** | **~5-8 min** | **~$0.36-0.58** |
-| When idle | — | **$0.00** |
-
-Network volume storage: ~$0.07/GB/month × 100 GB = ~$7/month.
+| **Total per video** | ~5-8 min | **~$0.36-0.58** |
 
 ---
 
@@ -307,30 +251,24 @@ Network volume storage: ~$0.07/GB/month × 100 GB = ~$7/month.
 
 ### Input (`job["input"]`)
 
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| `audio_base64` | string | **yes** | — | Base64-encoded audio file (.wav / .mp3) |
-| `image_base64` | string | ai2v only | — | Base64-encoded reference image |
-| `prompt` | string | no | "A person speaking naturally" | Text prompt |
-| `negative_prompt` | string | no | (built-in) | Negative prompt |
-| `stage` | string | no | `"ai2v"` | `"ai2v"` or `"at2v"` |
-| `resolution` | string | no | `"480p"` | `"480p"` or `"720p"` |
-| `num_inference_steps` | int | no | `50` | Denoising steps |
-| `text_guidance_scale` | float | no | `4.0` | Text conditioning strength |
-| `audio_guidance_scale` | float | no | `4.0` | Audio conditioning strength |
-| `num_segments` | int | no | `1` | More segments = longer video |
-| `seed` | int | no | `42` | Random seed |
+| Field | Type | Required | Default |
+|-------|------|----------|---------|
+| `audio_base64` | string | **yes** | — |
+| `image_base64` | string | ai2v only | — |
+| `prompt` | string | no | "A person speaking naturally" |
+| `negative_prompt` | string | no | (built-in) |
+| `stage` | string | no | `"ai2v"` |
+| `resolution` | string | no | `"480p"` |
+| `num_inference_steps` | int | no | `50` |
+| `text_guidance_scale` | float | no | `4.0` |
+| `audio_guidance_scale` | float | no | `4.0` |
+| `num_segments` | int | no | `1` |
+| `seed` | int | no | `42` |
 
 ### Output
 
 ```json
 { "video_base64": "<base64-encoded MP4>" }
-```
-
-On error:
-
-```json
-{ "error": "description of what went wrong" }
 ```
 
 ---
@@ -339,21 +277,23 @@ On error:
 
 | Problem | Fix |
 |---------|-----|
-| Cold start too slow | Enable **Flash Boot**; check volume is in same region |
-| OOM | Use A100 80 GB; lower resolution to 480p; reduce segments |
-| "No vocal detected" | Audio may not contain speech — convert to 16 kHz mono WAV first |
-| Worker keeps restarting | Check logs for import errors; verify Docker build completed |
-| Payload too large | Audio files >10 MB may hit RunPod limits — trim or compress first |
+| RunPod says "Could not find runpod.serverless.start()" | Make sure `rp_handler.py` has `runpod.serverless.start()` at module level (not inside `if __name__`) and the code is pushed to the default branch |
+| Cold start too slow | Enable Flash Boot; verify volume is in the same region |
+| OOM | Use A100 80 GB; lower resolution to 480p; set segments to 1 |
+| "No vocal detected" | Audio may not contain speech — try 16 kHz mono WAV |
+| Gradio shows "app is unprotected" | Set `GRADIO_PASSWORD` environment variable |
 
 ---
 
-## File Overview
+## Files
 
-| File | Description |
+| File | What it does |
 |------|-------------|
-| `rp_handler.py` | RunPod serverless worker (GPU container entry point) |
-| `app.py` | Gradio UI (lightweight, no GPU needed) |
-| `Dockerfile` | Worker container image |
+| `rp_handler.py` | RunPod serverless worker (GPU) |
+| `Dockerfile` | Docker image for the GPU worker (built by RunPod from GitHub) |
+| `app.py` | Gradio UI with password auth (no GPU) |
+| `Dockerfile.app` | Docker image for the Gradio UI (for DigitalOcean) |
+| `requirements.txt` | Python deps for the GPU worker |
+| `requirements-app.txt` | Python deps for the Gradio UI (`gradio`, `requests`) |
 | `download_weights.py` | One-time weight download to network volume |
-| `requirements.txt` | Python dependencies for the worker |
-| `.dockerignore` | Keeps Docker image lean |
+| `.dockerignore` | Keeps Docker images lean |

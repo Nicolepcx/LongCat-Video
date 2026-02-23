@@ -28,6 +28,8 @@ import datetime
 import traceback
 from pathlib import Path
 
+import runpod
+
 import numpy as np
 import PIL.Image
 import torch
@@ -501,9 +503,6 @@ def handler(job):
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# Entry point — must be at module level for RunPod's GitHub scanner to detect
 # ---------------------------------------------------------------------------
-if __name__ == "__main__":
-    import runpod
-
-    runpod.serverless.start({"handler": handler})
+runpod.serverless.start({"handler": handler})
