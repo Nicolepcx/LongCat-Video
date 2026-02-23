@@ -1,15 +1,42 @@
+# ── Core ML ──────────────────────────────────────────────
 torch==2.6.0
 numpy==1.26.4
-transformers==4.41.0
-loguru==0.7.2
-diffusers==0.35.1
+transformers==4.46.3
+diffusers==0.32.2
+accelerate
+safetensors
+peft
 einops==0.8.0
+loguru==0.7.2
 ftfy==6.2.0
-psutil==6.0.0
+
+# ── Vision / Video ──────────────────────────────────────
 av==12.0.0
 opencv-python==4.9.0.80
-flash-attn==2.7.4.post1
-streamlit==1.50.0
-pyarrow==20.0.0
 imageio==2.37.0
 imageio-ffmpeg==0.6.0
+
+# ── Audio / Avatar ──────────────────────────────────────
+librosa==0.11.0
+soundfile==0.13.1
+pyloudnorm==0.1.1
+audio-separator==0.30.2
+onnxruntime==1.16.3
+scipy==1.15.3
+soxr==0.5.0.post1
+
+# ── Scientific (avatar deps) ────────────────────────────
+scikit-learn==1.6.1
+scikit-image==0.25.2
+sympy==1.13.1
+
+# ── Utilities ────────────────────────────────────────────
+psutil==6.0.0
+tqdm
+regex
+
+# ── Serving / Deployment ────────────────────────────────
+runpod
+
+# ── NOTE: flash-attn must be installed separately ───────
+# pip install flash-attn --no-build-isolation

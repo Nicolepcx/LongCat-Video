@@ -1,8 +1,10 @@
 import os
 import json
+import shutil
 import librosa
 import binascii
 import imageio
+import imageio_ffmpeg
 import subprocess
 import numpy as np
 import os.path as osp
@@ -16,6 +18,24 @@ import torch.nn.functional as F
 import torchvision
 
 from ..context_parallel import context_parallel_util
+
+
+def _get_ffmpeg_exe():
+    """Return the path to an ffmpeg binary (imageio-ffmpeg bundled, or system)."""
+    try:
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return shutil.which("ffmpeg") or "ffmpeg"
+
+
+def _get_ffprobe_exe():
+    """Return the path to an ffprobe binary. imageio-ffmpeg only ships ffmpeg,
+    so we look next to it for ffprobe, then fall back to the system PATH."""
+    ffmpeg_path = _get_ffmpeg_exe()
+    ffprobe_candidate = os.path.join(os.path.dirname(ffmpeg_path), "ffprobe")
+    if os.path.isfile(ffprobe_candidate):
+        return ffprobe_candidate
+    return shutil.which("ffprobe") or "ffprobe"
 
 
 def torch_gc():
@@ -150,8 +170,9 @@ def cache_video(tensor,
         return cache_file
 
 def get_audio_duration(audio_path):
+    ffprobe = _get_ffprobe_exe()
     cmd = [
-        "ffprobe",
+        ffprobe,
         "-v", "quiet",
         "-print_format", "json",
         "-show_entries", "format=duration",
@@ -163,6 +184,8 @@ def get_audio_duration(audio_path):
 
 
 def save_video_ffmpeg(gen_video_samples, save_path, audio_path, fps=25, quality=5, high_quality_save=False):
+
+    ffmpeg = _get_ffmpeg_exe()
 
     def save_video(frames, save_path, fps, quality=9, ffmpeg_params=None):
         writer = imageio.get_writer(
@@ -184,7 +207,7 @@ def save_video_ffmpeg(gen_video_samples, save_path, audio_path, fps=25, quality=
     duration = T / fps
     save_path_crop_audio = save_path + "-cropaudio.wav"
     final_command = [
-        "ffmpeg",
+        ffmpeg,
         "-y",
         "-i",
         audio_path,
@@ -198,7 +221,7 @@ def save_video_ffmpeg(gen_video_samples, save_path, audio_path, fps=25, quality=
     crop_audio_duration = get_audio_duration(save_path_crop_audio)
     save_path_crop_tmp = save_path + "-cropvideo.mp4"
     cmd = [
-        "ffmpeg",
+        ffmpeg,
         "-y",
         "-i", save_path_tmp,
         "-t", f"{crop_audio_duration}",
@@ -212,7 +235,7 @@ def save_video_ffmpeg(gen_video_samples, save_path, audio_path, fps=25, quality=
     save_path = save_path + ".mp4"
     if high_quality_save:
         final_command = [
-            "ffmpeg",
+            ffmpeg,
             "-y",
             "-i", save_path_crop_tmp,
             "-i", save_path_crop_audio,
@@ -226,7 +249,7 @@ def save_video_ffmpeg(gen_video_samples, save_path, audio_path, fps=25, quality=
         subprocess.run(final_command, check=True)
     else:
         final_command = [
-            "ffmpeg",
+            ffmpeg,
             "-y",
             "-i",
             save_path_crop_tmp,

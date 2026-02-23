@@ -102,6 +102,7 @@ def generate(args):
     # load parsed args
     input_json = args.input_json
     checkpoint_dir = args.checkpoint_dir
+    base_model_dir = args.base_model_dir
     context_parallel_size = args.context_parallel_size
     num_inference_steps = args.num_inference_steps
     text_guidance_scale = args.text_guidance_scale
@@ -155,10 +156,10 @@ def generate(args):
     cp_split_hw = context_parallel_util.get_optimal_split(cp_size)
 
     # initialize models
-    tokenizer = AutoTokenizer.from_pretrained(os.path.join(checkpoint_dir, '..', 'LongCat-Video'), subfolder="tokenizer", torch_dtype=torch.bfloat16)
-    text_encoder = UMT5EncoderModel.from_pretrained(os.path.join(checkpoint_dir, '..', 'LongCat-Video'), subfolder="text_encoder", torch_dtype=torch.bfloat16)
-    vae = AutoencoderKLWan.from_pretrained(os.path.join(checkpoint_dir, '..', 'LongCat-Video'), subfolder="vae", torch_dtype=torch.bfloat16)
-    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(os.path.join(checkpoint_dir, '..', 'LongCat-Video'), subfolder="scheduler", torch_dtype=torch.bfloat16)
+    tokenizer = AutoTokenizer.from_pretrained(base_model_dir, subfolder="tokenizer", torch_dtype=torch.bfloat16)
+    text_encoder = UMT5EncoderModel.from_pretrained(base_model_dir, subfolder="text_encoder", torch_dtype=torch.bfloat16)
+    vae = AutoencoderKLWan.from_pretrained(base_model_dir, subfolder="vae", torch_dtype=torch.bfloat16)
+    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(base_model_dir, subfolder="scheduler", torch_dtype=torch.bfloat16)
     dit = LongCatVideoAvatarTransformer3DModel.from_pretrained(checkpoint_dir, subfolder="avatar_multi", cp_split_hw=cp_split_hw, torch_dtype=torch.bfloat16)
 
     # initialize audio models
@@ -439,7 +440,14 @@ def _parse_args():
     parser.add_argument(
         "--checkpoint_dir",
         type=str,
-        default="./weights/LongCat-Video-Avatar",
+        default=os.environ.get("AVATAR_WEIGHTS_DIR", "./weights/LongCat-Video-Avatar"),
+        help="Path to LongCat-Video-Avatar weights directory",
+    )
+    parser.add_argument(
+        "--base_model_dir",
+        type=str,
+        default=os.environ.get("BASE_MODEL_DIR", "./weights/LongCat-Video"),
+        help="Path to LongCat-Video base model weights (tokenizer, text_encoder, vae, scheduler)",
     )
 
     args = parser.parse_args()
