@@ -2,6 +2,7 @@ from typing import List, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from einops import rearrange
 
@@ -12,6 +13,15 @@ from ...context_parallel.ulysses_wrapper import ulysses_wrapper
 from ...audio_process.torch_utils import get_attn_map_with_target
 from .rope_3d import RotaryPositionalEmbedding1D
 from ...context_parallel import context_parallel_util
+
+# Detect if flash_attn is usable (compiled against the correct PyTorch ABI)
+_HAS_FLASH_ATTN = False
+try:
+    from flash_attn import flash_attn_func as _flash_attn_func  # noqa: F401
+    _HAS_FLASH_ATTN = True
+except (ImportError, RuntimeError):
+    _flash_attn_func = None
+    print("[attention.py] flash_attn not available — using PyTorch SDPA fallback", flush=True)
 
 
 def normalize_and_scale(column, source_range, target_range, epsilon=1e-8):
@@ -89,18 +99,23 @@ class Attention(nn.Module):
             )
             x = rearrange(x, "B S H D -> B H S D")
         elif self.enable_flashattn2:
-            from flash_attn import flash_attn_func
-            q = rearrange(q, "B H S D -> B S H D")
-            k = rearrange(k, "B H S D -> B S H D")
-            v = rearrange(v, "B H S D -> B S H D")
-            x = flash_attn_func(
-                q,
-                k,
-                v,
-                dropout_p=0.0,
-                softmax_scale=self.scale,
-            )
-            x = rearrange(x, "B S H D -> B H S D")
+            if _HAS_FLASH_ATTN:
+                q = rearrange(q, "B H S D -> B S H D")
+                k = rearrange(k, "B H S D -> B S H D")
+                v = rearrange(v, "B H S D -> B S H D")
+                x = _flash_attn_func(
+                    q,
+                    k,
+                    v,
+                    dropout_p=0.0,
+                    softmax_scale=self.scale,
+                )
+                x = rearrange(x, "B S H D -> B H S D")
+            else:
+                # PyTorch SDPA fallback — q, k, v are already [B, H, S, D]
+                x = F.scaled_dot_product_attention(
+                    q, k, v, dropout_p=0.0, scale=self.scale,
+                )
         elif self.enable_xformers:
             import xformers.ops
             # Input tensors must be in format ``[B, M, H, K]``, where B is the batch size, M \
@@ -111,7 +126,10 @@ class Attention(nn.Module):
             x = xformers.ops.memory_efficient_attention(q, k, v, attn_bias=None, op=None,)
             x = rearrange(x, "B M H K -> B H M K")
         else:
-            raise RuntimeError("Unsupported attention operations.")
+            # Final fallback: use PyTorch SDPA
+            x = F.scaled_dot_product_attention(
+                q, k, v, dropout_p=0.0, scale=self.scale,
+            )
 
         return x
 
@@ -397,18 +415,23 @@ class SingleStreamAttention(nn.Module):
             )
             x = rearrange(x, "B S H D -> B H S D")
         elif self.enable_flashattn2:
-            from flash_attn import flash_attn_func
-            q = rearrange(q, "B H S D -> B S H D")
-            encoder_k = rearrange(encoder_k, "B H S D -> B S H D")
-            encoder_v = rearrange(encoder_v, "B H S D -> B S H D")
-            x = flash_attn_func(
-                q,
-                encoder_k,
-                encoder_v,
-                dropout_p=0.0,
-                softmax_scale=self.scale,
-            )
-            x = rearrange(x, "B S H D -> B H S D")
+            if _HAS_FLASH_ATTN:
+                q = rearrange(q, "B H S D -> B S H D")
+                encoder_k = rearrange(encoder_k, "B H S D -> B S H D")
+                encoder_v = rearrange(encoder_v, "B H S D -> B S H D")
+                x = _flash_attn_func(
+                    q,
+                    encoder_k,
+                    encoder_v,
+                    dropout_p=0.0,
+                    softmax_scale=self.scale,
+                )
+                x = rearrange(x, "B S H D -> B H S D")
+            else:
+                # PyTorch SDPA fallback — q, k, v are already [B, H, S, D]
+                x = F.scaled_dot_product_attention(
+                    q, encoder_k, encoder_v, dropout_p=0.0, scale=self.scale,
+                )
         elif self.enable_xformers:
             import xformers.ops
             q = rearrange(q, "B H M K -> B M H K")

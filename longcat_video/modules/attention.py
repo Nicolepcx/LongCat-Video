@@ -2,6 +2,7 @@ from typing import List, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from einops import rearrange
 
@@ -9,6 +10,16 @@ from .rope_3d import RotaryPositionalEmbedding
 from .blocks import RMSNorm_FP32
 from ..block_sparse_attention.bsa_interface import flash_attn_bsa_3d
 from ..context_parallel.ulysses_wrapper import ulysses_wrapper
+
+# Detect if flash_attn is usable (compiled against the correct PyTorch ABI)
+_HAS_FLASH_ATTN = False
+try:
+    from flash_attn import flash_attn_func as _flash_attn_func  # noqa: F401
+    from flash_attn import flash_attn_varlen_func as _flash_attn_varlen_func  # noqa: F401
+    _HAS_FLASH_ATTN = True
+except (ImportError, RuntimeError):
+    _flash_attn_func = None
+    _flash_attn_varlen_func = None
 
 
 class Attention(nn.Module):
@@ -78,18 +89,23 @@ class Attention(nn.Module):
             )
             x = rearrange(x, "B S H D -> B H S D")
         elif self.enable_flashattn2:
-            from flash_attn import flash_attn_func
-            q = rearrange(q, "B H S D -> B S H D")
-            k = rearrange(k, "B H S D -> B S H D")
-            v = rearrange(v, "B H S D -> B S H D")
-            x = flash_attn_func(
-                q,
-                k,
-                v,
-                dropout_p=0.0,
-                softmax_scale=self.scale,
-            )
-            x = rearrange(x, "B S H D -> B H S D")
+            if _HAS_FLASH_ATTN:
+                q = rearrange(q, "B H S D -> B S H D")
+                k = rearrange(k, "B H S D -> B S H D")
+                v = rearrange(v, "B H S D -> B S H D")
+                x = _flash_attn_func(
+                    q,
+                    k,
+                    v,
+                    dropout_p=0.0,
+                    softmax_scale=self.scale,
+                )
+                x = rearrange(x, "B S H D -> B H S D")
+            else:
+                # PyTorch SDPA fallback — q, k, v are already [B, H, S, D]
+                x = F.scaled_dot_product_attention(
+                    q, k, v, dropout_p=0.0, scale=self.scale,
+                )
         elif self.enable_xformers:
             import xformers.ops
             # Input tensors must be in format ``[B, M, H, K]``, where B is the batch size, M \
@@ -100,7 +116,10 @@ class Attention(nn.Module):
             x = xformers.ops.memory_efficient_attention(q, k, v, attn_bias=None, op=None,)
             x = rearrange(x, "B M H K -> B H M K")
         else:
-            raise RuntimeError("Unsupported attention operations.")
+            # Final fallback: use PyTorch SDPA
+            x = F.scaled_dot_product_attention(
+                q, k, v, dropout_p=0.0, scale=self.scale,
+            )
 
         return x
 
@@ -230,22 +249,49 @@ class MultiHeadCrossAttention(nn.Module):
                 max_seqlen_k=max(kv_seqlen),
             )[0]
         elif self.enable_flashattn2:
-            from flash_attn import flash_attn_varlen_func
-            x = flash_attn_varlen_func(
-                q=q[0],
-                k=k[0],
-                v=v[0],
-                cu_seqlens_q=torch.tensor([0] + [N] * B, device=q.device).cumsum(0).to(torch.int32),
-                cu_seqlens_k=torch.tensor([0] + kv_seqlen, device=q.device).cumsum(0).to(torch.int32),
-                max_seqlen_q=N,
-                max_seqlen_k=max(kv_seqlen),
-            )
+            if _HAS_FLASH_ATTN:
+                x = _flash_attn_varlen_func(
+                    q=q[0],
+                    k=k[0],
+                    v=v[0],
+                    cu_seqlens_q=torch.tensor([0] + [N] * B, device=q.device).cumsum(0).to(torch.int32),
+                    cu_seqlens_k=torch.tensor([0] + kv_seqlen, device=q.device).cumsum(0).to(torch.int32),
+                    max_seqlen_q=N,
+                    max_seqlen_k=max(kv_seqlen),
+                )
+            else:
+                # PyTorch SDPA fallback for variable-length cross attention
+                # q shape: [1, total_q, H, D], k/v shape: [1, total_kv, H, D]
+                # Split per batch element and do individual SDPA
+                q_split = q[0].split([N] * B, dim=0)  # list of [N, H, D]
+                k_split = k[0].split(kv_seqlen, dim=0)  # list of [kv_i, H, D]
+                v_split = v[0].split(kv_seqlen, dim=0)
+                outs = []
+                for qi, ki, vi in zip(q_split, k_split, v_split):
+                    # [N, H, D] -> [1, H, N, D]
+                    qi = qi.unsqueeze(0).permute(0, 2, 1, 3)
+                    ki = ki.unsqueeze(0).permute(0, 2, 1, 3)
+                    vi = vi.unsqueeze(0).permute(0, 2, 1, 3)
+                    oi = F.scaled_dot_product_attention(qi, ki, vi, dropout_p=0.0)
+                    outs.append(oi.permute(0, 2, 1, 3).squeeze(0))  # [N, H, D]
+                x = torch.cat(outs, dim=0).unsqueeze(0)  # [1, total_q, H, D]
         elif self.enable_xformers:
             import xformers.ops
             attn_bias = xformers.ops.fmha.attn_bias.BlockDiagonalMask.from_seqlens([N] * B, kv_seqlen)
             x = xformers.ops.memory_efficient_attention(q, k, v, attn_bias=attn_bias)
         else:
-            raise RuntimeError("Unsupported attention operations.")
+            # Final fallback: per-batch SDPA
+            q_split = q[0].split([N] * B, dim=0)
+            k_split = k[0].split(kv_seqlen, dim=0)
+            v_split = v[0].split(kv_seqlen, dim=0)
+            outs = []
+            for qi, ki, vi in zip(q_split, k_split, v_split):
+                qi = qi.unsqueeze(0).permute(0, 2, 1, 3)
+                ki = ki.unsqueeze(0).permute(0, 2, 1, 3)
+                vi = vi.unsqueeze(0).permute(0, 2, 1, 3)
+                oi = F.scaled_dot_product_attention(qi, ki, vi, dropout_p=0.0)
+                outs.append(oi.permute(0, 2, 1, 3).squeeze(0))
+            x = torch.cat(outs, dim=0).unsqueeze(0)
 
 
         x = x.view(B, -1, C)
