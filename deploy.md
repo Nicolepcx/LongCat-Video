@@ -275,6 +275,13 @@ Response:
 { "video_base64": "<base64-encoded MP4>" }
 ```
 
+Or use the helper script:
+
+```bash
+export INFERENCE_API_URL="https://<workspace>--longcat-video-avatar-inference-endpoint.modal.run"
+./modal_test.sh
+```
+
 ---
 
 ## Part 3: Gradio UI on DigitalOcean
