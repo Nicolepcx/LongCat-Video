@@ -6,9 +6,13 @@ Files are sent directly to RunPod as base64 — no S3, no file hosting needed.
 
 Usage
 -----
+RunPod backend:
     export RUNPOD_API_KEY="rp_xxxxxxxx"
     export RUNPOD_ENDPOINT_ID="your-endpoint-id"
-    pip install gradio requests
+    python app.py
+
+Modal backend:
+    export INFERENCE_API_URL="https://<workspace>--<app>-inference-endpoint.modal.run"
     python app.py
 """
 
@@ -24,6 +28,7 @@ import gradio as gr
 # ---------------------------------------------------------------------------
 RUNPOD_API_KEY = os.environ.get("RUNPOD_API_KEY", "")
 RUNPOD_ENDPOINT_ID = os.environ.get("RUNPOD_ENDPOINT_ID", "")
+INFERENCE_API_URL = os.environ.get("INFERENCE_API_URL", "").strip()
 POLL_INTERVAL = 5  # seconds between status checks
 
 
@@ -64,10 +69,12 @@ def generate_video(
     """Encode files as base64, submit RunPod job, poll, return video."""
 
     # --- Validate ---
-    if not RUNPOD_API_KEY:
-        raise gr.Error("Set the RUNPOD_API_KEY environment variable first")
-    if not RUNPOD_ENDPOINT_ID:
-        raise gr.Error("Set the RUNPOD_ENDPOINT_ID environment variable first")
+    use_modal = bool(INFERENCE_API_URL)
+    if not use_modal:
+        if not RUNPOD_API_KEY:
+            raise gr.Error("Set RUNPOD_API_KEY (RunPod mode) or INFERENCE_API_URL (Modal mode)")
+        if not RUNPOD_ENDPOINT_ID:
+            raise gr.Error("Set RUNPOD_ENDPOINT_ID (RunPod mode) or INFERENCE_API_URL (Modal mode)")
     if audio_file is None:
         raise gr.Error("Please upload an audio file")
     if stage == "ai2v" and image_file is None:
@@ -89,55 +96,67 @@ def generate_video(
     if image_file is not None:
         payload["image_base64"] = _file_to_base64(image_file)
 
-    # --- Submit job ---
-    progress(0.10, desc="Submitting job to RunPod …")
-    resp = requests.post(
-        _api_url("/run"),
-        headers=_headers(),
-        json={"input": payload},
-        timeout=60,
-    )
-    resp.raise_for_status()
-    job_id = resp.json()["id"]
-
-    # --- Poll for result ---
-    progress(0.15, desc=f"Job {job_id} queued — waiting for GPU worker …")
-    timeout = 900  # 15 min
-    start = time.time()
-
-    while time.time() - start < timeout:
-        r = requests.get(
-            _api_url(f"/status/{job_id}"),
-            headers=_headers(),
-            timeout=30,
+    # --- Submit / Execute job ---
+    if use_modal:
+        progress(0.10, desc="Submitting job to Modal endpoint …")
+        r = requests.post(
+            INFERENCE_API_URL,
+            json=payload,
+            timeout=3600,  # modal call is synchronous
         )
         r.raise_for_status()
-        data = r.json()
-        status = data.get("status")
-
-        if status == "COMPLETED":
-            output = data.get("output", {})
-            if "error" in output:
-                raise gr.Error(f"Inference error: {output['error']}")
-            break
-
-        elif status == "FAILED":
-            error_msg = data.get("output", {}).get("error", "Unknown error")
-            raise gr.Error(f"Job failed: {error_msg}")
-
-        elif status == "IN_PROGRESS":
-            elapsed = time.time() - start
-            frac = min(0.15 + elapsed / timeout * 0.75, 0.90)
-            progress(frac, desc="Generating video … (this takes a few minutes)")
-
-        else:  # IN_QUEUE, etc.
-            elapsed = time.time() - start
-            frac = min(0.15 + elapsed / timeout * 0.30, 0.40)
-            progress(frac, desc=f"Status: {status} — waiting for worker …")
-
-        time.sleep(POLL_INTERVAL)
+        output = r.json()
+        if "error" in output:
+            raise gr.Error(f"Inference error: {output['error']}")
     else:
-        raise gr.Error(f"Job timed out after {timeout}s")
+        progress(0.10, desc="Submitting job to RunPod …")
+        resp = requests.post(
+            _api_url("/run"),
+            headers=_headers(),
+            json={"input": payload},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        job_id = resp.json()["id"]
+
+        # --- Poll for result ---
+        progress(0.15, desc=f"Job {job_id} queued — waiting for GPU worker …")
+        timeout = 900  # 15 min
+        start = time.time()
+
+        while time.time() - start < timeout:
+            r = requests.get(
+                _api_url(f"/status/{job_id}"),
+                headers=_headers(),
+                timeout=30,
+            )
+            r.raise_for_status()
+            data = r.json()
+            status = data.get("status")
+
+            if status == "COMPLETED":
+                output = data.get("output", {})
+                if "error" in output:
+                    raise gr.Error(f"Inference error: {output['error']}")
+                break
+
+            elif status == "FAILED":
+                error_msg = data.get("output", {}).get("error", "Unknown error")
+                raise gr.Error(f"Job failed: {error_msg}")
+
+            elif status == "IN_PROGRESS":
+                elapsed = time.time() - start
+                frac = min(0.15 + elapsed / timeout * 0.75, 0.90)
+                progress(frac, desc="Generating video … (this takes a few minutes)")
+
+            else:  # IN_QUEUE, etc.
+                elapsed = time.time() - start
+                frac = min(0.15 + elapsed / timeout * 0.30, 0.40)
+                progress(frac, desc=f"Status: {status} — waiting for worker …")
+
+            time.sleep(POLL_INTERVAL)
+        else:
+            raise gr.Error(f"Job timed out after {timeout}s")
 
     # --- Decode video ---
     progress(0.95, desc="Decoding video …")
@@ -227,13 +246,13 @@ def build_ui():
                 gr.Markdown(
                     """
                     ### How it works
-                    1. Your audio & image are sent directly to RunPod (as base64)
-                    2. A GPU worker picks up the job (cold start ~2-3 min if scaled to zero)
-                    3. Inference runs (~3-10 min depending on settings)
+                    1. Your audio & image are sent directly to the inference API (as base64)
+                    2. A GPU worker picks up the job (cold start if scaled to zero)
+                    3. Inference runs (~10-20 min depending on settings)
                     4. The video is sent back to your browser
 
-                    **Tip:** If the worker is cold (scaled to zero), the first request
-                    takes longer while it loads model weights. Follow-up requests are faster.
+                    **Tip:** For RunPod mode set `RUNPOD_API_KEY` + `RUNPOD_ENDPOINT_ID`.
+                    For Modal mode set `INFERENCE_API_URL`.
                     """
                 )
 

@@ -72,7 +72,24 @@ torchrun --nproc_per_node=1 run_demo_avatar_single_audio_to_video.py \
 `setup_pod.sh` handles system deps (ffmpeg), Python packages, flash-attn compilation
 (with automatic PyTorch SDPA fallback if flash-attn can't compile), and weight verification.
 
-### Option B: Local / Conda Installation
+### Option B: Modal (Serverless GPU + persistent volume)
+
+```bash
+pip install -r requirements-modal.txt
+modal setup
+modal volume create longcat-weights
+
+# One-time weight download
+modal run modal_app.py --download --hf-token <hf_token>
+
+# Deploy HTTP endpoint
+modal deploy modal_app.py
+```
+
+The deployed `inference_endpoint` accepts the same payload schema used by RunPod:
+`audio_base64`, `image_base64`, `prompt`, `stage`, etc.
+
+### Option C: Local / Conda Installation
 
 Clone the repo:
 
@@ -251,10 +268,11 @@ The *Image-to-Video* MOS evaluation results on our internal benchmark.
 
 ## Cloud Deployment
 
-For deploying as a service with a Gradio UI frontend and RunPod GPU backend,
+For deploying as a service with a Gradio UI frontend and either RunPod or Modal backend,
 see the comprehensive [`deploy.md`](deploy.md) guide which covers:
 
 - **RunPod Network Volume** setup for persistent model weights (~200 GB)
+- **Modal Volume + endpoint** deployment with `modal_app.py`
 - **`setup_pod.sh`** for one-command pod configuration
 - **RunPod Serverless** endpoint (scale-to-zero, pay-per-second)
 - **DigitalOcean** Gradio UI with password protection ($5/mo)

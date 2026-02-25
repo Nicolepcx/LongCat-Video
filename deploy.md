@@ -1,9 +1,10 @@
 # Deploying LongCat-Video Avatar
 
-Two deployment options:
+Three deployment options:
 
 1. **RunPod Pod** (recommended) — persistent GPU instance with network volume for weights
-2. **Gradio UI on DigitalOcean** — lightweight password-protected frontend
+2. **Modal Endpoint** — serverless GPU endpoint with persistent Modal Volume
+3. **Gradio UI on DigitalOcean** — lightweight password-protected frontend
 
 ---
 
@@ -17,7 +18,7 @@ Two deployment options:
                 │  base64 payload via RunPod API
                 ▼
 ┌────────────────────────────────┐      ┌─────────────────────────────┐
-│  RunPod Pod / Serverless       │◄────►│  Network Volume (250 GB)    │
+│  RunPod Pod / Modal Endpoint   │◄────►│  Persistent Volume (250 GB) │
 │  A100 80 GB GPU                │      │  /workspace/weights/        │
 │  Returns video as base64       │      │  ├── LongCat-Video/         │
 │                                │      │  └── LongCat-Video-Avatar/  │
@@ -201,12 +202,87 @@ curl -s -X POST "https://api.runpod.ai/v2/${ENDPOINT_ID}/run" \
 
 ---
 
-## Part 2: Gradio UI on DigitalOcean
+## Part 2: Modal Deployment
+
+Modal is a strong alternative to RunPod Serverless for this project: persistent
+volume support, clean Python DX, and scale-to-zero endpoints.
+
+### 2.1 — Install Modal CLI (local machine)
+
+```bash
+pip install -r requirements-modal.txt
+modal setup
+```
+
+### 2.2 — Create Modal volume
+
+```bash
+modal volume create longcat-weights
+```
+
+If you use a different name, set:
+
+```bash
+export MODAL_WEIGHTS_VOLUME="your-volume-name"
+```
+
+### 2.3 — One-time weight download to Modal Volume
+
+```bash
+cd LongCat-Video
+modal run modal_app.py --download --hf-token hf_xxxxxxxx
+```
+
+This populates:
+
+```
+/weights/weights/LongCat-Video
+/weights/weights/LongCat-Video-Avatar
+```
+
+### 2.4 — Deploy Modal endpoint
+
+```bash
+modal deploy modal_app.py
+```
+
+Deployment output includes a public URL for `inference_endpoint`, typically:
+
+```text
+https://<workspace>--longcat-video-avatar-inference-endpoint.modal.run
+```
+
+### 2.5 — Test Modal endpoint
+
+```bash
+AUDIO_B64=$(base64 -i assets/avatar/single/man.mp3)
+IMAGE_B64=$(base64 -i assets/avatar/single/man.png)
+
+curl -X POST "https://<workspace>--longcat-video-avatar-inference-endpoint.modal.run" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"audio_base64\": \"${AUDIO_B64}\",
+    \"image_base64\": \"${IMAGE_B64}\",
+    \"prompt\": \"A person speaking naturally\",
+    \"stage\": \"ai2v\",
+    \"resolution\": \"480p\"
+  }"
+```
+
+Response:
+
+```json
+{ "video_base64": "<base64-encoded MP4>" }
+```
+
+---
+
+## Part 3: Gradio UI on DigitalOcean
 
 The Gradio app (`app.py`) is a lightweight frontend — no GPU needed. It base64-encodes
 your audio/image and sends them to the RunPod endpoint.
 
-### 2.1 — Deploy on DigitalOcean App Platform
+### 3.1 — Deploy on DigitalOcean App Platform
 
 1. **DigitalOcean Console → App Platform → Create App**
 2. **Source:** GitHub → select `Nicolepcx/LongCat-Video`
@@ -216,20 +292,24 @@ your audio/image and sends them to the RunPod endpoint.
 
 | Variable | Value |
 |----------|-------|
-| `RUNPOD_API_KEY` | `rp_xxxxxxxx` |
-| `RUNPOD_ENDPOINT_ID` | your endpoint ID |
+| `RUNPOD_API_KEY` | `rp_xxxxxxxx` (RunPod backend only) |
+| `RUNPOD_ENDPOINT_ID` | your endpoint ID (RunPod backend only) |
+| `INFERENCE_API_URL` | `https://<workspace>--longcat-video-avatar-inference-endpoint.modal.run` (Modal backend only) |
 | `GRADIO_USERNAME` | your login username |
 | `GRADIO_PASSWORD` | a strong password |
 | `PORT` | `7860` |
 
 6. Deploy
 
-### 2.2 — Test locally (optional)
+### 3.2 — Test locally (optional)
 
 ```bash
 pip install gradio requests
-export RUNPOD_API_KEY="rp_xxxxxxxx"
-export RUNPOD_ENDPOINT_ID="your-endpoint-id"
+# RunPod backend:
+# export RUNPOD_API_KEY="rp_xxxxxxxx"
+# export RUNPOD_ENDPOINT_ID="your-endpoint-id"
+# OR Modal backend:
+# export INFERENCE_API_URL="https://<workspace>--longcat-video-avatar-inference-endpoint.modal.run"
 export GRADIO_PASSWORD="testpass"
 python app.py
 # Open http://localhost:7860
