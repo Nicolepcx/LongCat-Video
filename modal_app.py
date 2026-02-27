@@ -49,15 +49,21 @@ def _image() -> modal.Image:
     return (
         modal.Image.from_registry("nvidia/cuda:12.4.1-devel-ubuntu22.04", add_python="3.11")
         .apt_install("ffmpeg", "libsndfile1", "git")
-        .add_local_file("requirements.txt", "/tmp/requirements.txt")
+        # requirements.txt is needed during image build, so copy it into the image layer.
+        .add_local_file("requirements.txt", "/tmp/requirements.txt", copy=True)
         .run_commands(
             "pip install -U pip packaging ninja",
-            "pip install -r /tmp/requirements.txt",
+            # audio-separator pulls demucs/diffq, which can fail wheel builds on Modal.
+            # We install a filtered requirements set and fallback to raw audio in code.
+            "grep -v '^audio-separator' /tmp/requirements.txt > /tmp/requirements_modal.txt",
+            "pip install -r /tmp/requirements_modal.txt",
+            "pip install 'fastapi[standard]>=0.115.0'",
             # Try flash-attn, but don't fail build if unavailable.
             "pip install --no-build-isolation --no-cache-dir flash-attn || true",
         )
-        .add_local_dir(".", remote_path="/root/LongCat-Video")
         .workdir("/root/LongCat-Video")
+        # Add project source last so Modal can mount local files at container startup.
+        .add_local_dir(".", remote_path="/root/LongCat-Video")
     )
 
 
@@ -75,11 +81,14 @@ def _generate_random_uid() -> str:
 @app.function(
     image=image,
     volumes={VOLUME_MOUNT_PATH: weights_volume},
-    timeout=60 * 60 * 4,
+    timeout=60 * 60 * 8,  # 8 hours — large downloads can be slow on Modal CPU containers
 )
 def download_weights(hf_token: str | None = None, force: bool = False) -> dict:
     """
     One-time weight download into Modal Volume.
+
+    Downloads each model separately and commits after each one so that
+    partial progress is preserved if the container is interrupted.
 
     Usage:
       modal run modal_app.py::download_weights --hf-token YOUR_TOKEN
@@ -96,12 +105,53 @@ def download_weights(hf_token: str | None = None, force: bool = False) -> dict:
     base_dir = f"{WEIGHTS_DIR}/LongCat-Video"
     avatar_dir = f"{WEIGHTS_DIR}/LongCat-Video-Avatar"
 
+    # Thorough completeness checks (not just one directory)
+    def _base_model_complete():
+        """Check that all critical subdirs of LongCat-Video have real files."""
+        checks = [
+            f"{base_dir}/dit/diffusion_pytorch_model-00001-of-00006.safetensors",
+            f"{base_dir}/vae/diffusion_pytorch_model.safetensors",
+            f"{base_dir}/scheduler/scheduler_config.json",
+        ]
+        # tokenizer: look for any .model file (spiece.model / tokenizer.model)
+        tok_dir = f"{base_dir}/tokenizer"
+        tok_ok = False
+        if os.path.isdir(tok_dir):
+            for f in os.listdir(tok_dir):
+                if f.endswith(".model") or f == "tokenizer.json":
+                    tok_ok = True
+                    break
+        # text_encoder: look for at least one safetensors shard
+        te_dir = f"{base_dir}/text_encoder"
+        te_ok = False
+        if os.path.isdir(te_dir):
+            for f in os.listdir(te_dir):
+                if f.endswith(".safetensors"):
+                    te_ok = True
+                    break
+        files_ok = all(os.path.exists(c) for c in checks)
+        return files_ok and tok_ok and te_ok
+
+    def _avatar_model_complete():
+        checks = [
+            f"{avatar_dir}/avatar_single/diffusion_pytorch_model-00001-of-00006.safetensors",
+            f"{avatar_dir}/chinese-wav2vec2-base/pytorch_model.bin",
+        ]
+        return all(os.path.exists(c) for c in checks)
+
     if force and os.path.exists(base_dir):
         shutil.rmtree(base_dir, ignore_errors=True)
     if force and os.path.exists(avatar_dir):
         shutil.rmtree(avatar_dir, ignore_errors=True)
 
-    if not os.path.exists(f"{base_dir}/dit"):
+    # --- Model 1: LongCat-Video (~83 GB) ---
+    if _base_model_complete() and not force:
+        print("✓ LongCat-Video already complete — skipping")
+    else:
+        print("Downloading LongCat-Video (~83 GB) ...")
+        if os.path.exists(base_dir):
+            print("  (Removing incomplete previous download)")
+            shutil.rmtree(base_dir, ignore_errors=True)
         snapshot_download(
             repo_id="meituan-longcat/LongCat-Video",
             local_dir=base_dir,
@@ -109,16 +159,33 @@ def download_weights(hf_token: str | None = None, force: bool = False) -> dict:
         )
         shutil.rmtree(os.environ["HF_HOME"], ignore_errors=True)
         os.makedirs(os.environ["HF_HOME"], exist_ok=True)
+        print("Committing LongCat-Video to volume ...")
+        weights_volume.commit()
+        print("✓ LongCat-Video saved to volume")
 
-    if not os.path.exists(f"{avatar_dir}/avatar_single"):
+    # --- Model 2: LongCat-Video-Avatar (~120 GB) ---
+    if _avatar_model_complete() and not force:
+        print("✓ LongCat-Video-Avatar already complete — skipping")
+    else:
+        print("Downloading LongCat-Video-Avatar (~120 GB) ...")
+        if os.path.exists(avatar_dir):
+            print("  (Removing incomplete previous download)")
+            shutil.rmtree(avatar_dir, ignore_errors=True)
         snapshot_download(
             repo_id="meituan-longcat/LongCat-Video-Avatar",
             local_dir=avatar_dir,
             token=hf_token,
         )
+        shutil.rmtree(os.environ["HF_HOME"], ignore_errors=True)
+        print("Committing LongCat-Video-Avatar to volume ...")
+        weights_volume.commit()
+        print("✓ LongCat-Video-Avatar saved to volume")
 
-    shutil.rmtree(os.environ["HF_HOME"], ignore_errors=True)
-    weights_volume.commit()
+    # Final cleanup of any remaining cache
+    hf_cache = os.environ.get("HF_HOME", "")
+    if hf_cache and os.path.exists(hf_cache):
+        shutil.rmtree(hf_cache, ignore_errors=True)
+        weights_volume.commit()
 
     return {
         "weights_dir": WEIGHTS_DIR,
@@ -130,6 +197,7 @@ def download_weights(hf_token: str | None = None, force: bool = False) -> dict:
 @app.cls(
     image=image,
     gpu="A100-80GB",
+    memory=262144,  # 256 GB system RAM — needed to load ~200GB of weights
     timeout=60 * 60,
     scaledown_window=60 * 5,
     volumes={VOLUME_MOUNT_PATH: weights_volume},
@@ -137,14 +205,22 @@ def download_weights(hf_token: str | None = None, force: bool = False) -> dict:
 class AvatarInference:
     @modal.enter()
     def load(self):
+        import sys
+        t0 = time.time()
+        def _log(msg):
+            elapsed = time.time() - t0
+            print(f"[{elapsed:7.1f}s] {msg}", flush=True)
+
+        _log("Starting model load ...")
+        _log("Importing libraries ...")
         import librosa
         import numpy as np
         import PIL.Image
         import torch
         import torch.distributed as dist
-        from audio_separator.separator import Separator
         from diffusers.utils import load_image
         from transformers import AutoTokenizer, UMT5EncoderModel, Wav2Vec2FeatureExtractor
+        _log("Core imports done")
 
         from longcat_video.audio_process.torch_utils import save_video_ffmpeg
         from longcat_video.audio_process.wav2vec2 import Wav2Vec2ModelWrapper
@@ -153,6 +229,7 @@ class AvatarInference:
         from longcat_video.modules.avatar.longcat_video_dit_avatar import LongCatVideoAvatarTransformer3DModel
         from longcat_video.modules.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
         from longcat_video.pipeline_longcat_video_avatar import LongCatVideoAvatarPipeline
+        _log("Project imports done")
 
         self.np = np
         self.PIL = PIL
@@ -169,12 +246,18 @@ class AvatarInference:
                 f"Missing weights in {WEIGHTS_DIR}. Run download_weights first."
             )
 
+        _log(f"GPU available: {torch.cuda.is_available()}")
+        if torch.cuda.is_available():
+            _log(f"GPU: {torch.cuda.get_device_name(0)}")
+            _log(f"GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+
         os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
         os.environ.setdefault("MASTER_PORT", "29500")
         os.environ.setdefault("RANK", "0")
         os.environ.setdefault("WORLD_SIZE", "1")
         os.environ.setdefault("LOCAL_RANK", "0")
 
+        _log("Initializing process group ...")
         try:
             if not dist.is_initialized():
                 dist.init_process_group(
@@ -187,6 +270,7 @@ class AvatarInference:
                     backend="gloo",
                     timeout=datetime.timedelta(seconds=3600),
                 )
+        _log("Process group initialized")
 
         self.local_rank = int(os.environ.get("LOCAL_RANK", "0"))
         if torch.cuda.is_available():
@@ -199,44 +283,60 @@ class AvatarInference:
         )
         cp_split_hw = context_parallel_util.get_optimal_split(1)
 
+        _log("Loading tokenizer ...")
         tokenizer = AutoTokenizer.from_pretrained(
             base_model_dir, subfolder="tokenizer", torch_dtype=torch.bfloat16
         )
+        _log("Loading text_encoder ...")
         text_encoder = UMT5EncoderModel.from_pretrained(
             base_model_dir, subfolder="text_encoder", torch_dtype=torch.bfloat16
         )
+        _log("Loading vae ...")
         vae = AutoencoderKLWan.from_pretrained(
             base_model_dir, subfolder="vae", torch_dtype=torch.bfloat16
         )
+        _log("Loading scheduler ...")
         scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             base_model_dir, subfolder="scheduler", torch_dtype=torch.bfloat16
         )
+        _log("Loading dit (avatar_single) — this is the largest component ...")
         dit = LongCatVideoAvatarTransformer3DModel.from_pretrained(
             avatar_weights_dir,
             subfolder="avatar_single",
             cp_split_hw=cp_split_hw,
             torch_dtype=torch.bfloat16,
         )
+        _log("dit loaded")
 
+        _log("Loading wav2vec audio encoder ...")
         wav2vec_path = os.path.join(avatar_weights_dir, "chinese-wav2vec2-base")
         audio_encoder = Wav2Vec2ModelWrapper(wav2vec_path).to(self.local_rank)
         audio_encoder.feature_extractor._freeze_parameters()
         wav2vec_feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(
             wav2vec_path, local_files_only=True
         )
+        _log("wav2vec loaded")
 
-        vocal_separator_path = os.path.join(
-            avatar_weights_dir, "vocal_separator/Kim_Vocal_2.onnx"
-        )
-        self.audio_output_dir_temp = Path("/tmp/audio_temp")
-        self.audio_output_dir_temp.mkdir(parents=True, exist_ok=True)
-        self.vocal_separator = Separator(
-            output_dir=self.audio_output_dir_temp / "vocals",
-            output_single_stem="vocals",
-            model_file_dir=os.path.dirname(vocal_separator_path),
-        )
-        self.vocal_separator.load_model(os.path.basename(vocal_separator_path))
+        self.vocal_separator = None
+        try:
+            from audio_separator.separator import Separator
 
+            vocal_separator_path = os.path.join(
+                avatar_weights_dir, "vocal_separator/Kim_Vocal_2.onnx"
+            )
+            self.audio_output_dir_temp = Path("/tmp/audio_temp")
+            self.audio_output_dir_temp.mkdir(parents=True, exist_ok=True)
+            self.vocal_separator = Separator(
+                output_dir=self.audio_output_dir_temp / "vocals",
+                output_single_stem="vocals",
+                model_file_dir=os.path.dirname(vocal_separator_path),
+            )
+            self.vocal_separator.load_model(os.path.basename(vocal_separator_path))
+        except Exception:
+            # Fallback path for environments where audio-separator isn't installed.
+            self.vocal_separator = None
+
+        _log("Building pipeline ...")
         self.pipe = LongCatVideoAvatarPipeline(
             tokenizer=tokenizer,
             text_encoder=text_encoder,
@@ -247,14 +347,18 @@ class AvatarInference:
             wav2vec_feature_extractor=wav2vec_feature_extractor,
         )
         self.pipe.to(self.local_rank)
+        _log("Pipeline moved to GPU")
 
         os.makedirs(OUTPUT_DIR, exist_ok=True)
+        _log(f"✓ Model fully loaded in {time.time() - t0:.1f}s — ready for inference")
 
     def _torch_gc(self):
         self.torch.cuda.empty_cache()
         self.torch.cuda.ipc_collect()
 
     def _extract_vocal_from_speech(self, source_path: str, target_path: str):
+        if self.vocal_separator is None:
+            return source_path
         outputs = self.vocal_separator.separate(source_path)
         if len(outputs) <= 0:
             return None
@@ -263,8 +367,7 @@ class AvatarInference:
         shutil.move(default_vocal_path, target_path)
         return target_path
 
-    @modal.method()
-    def generate(self, payload: dict) -> dict:
+    def _generate_impl(self, payload: dict) -> dict:
         audio_tmp_path = None
         image_tmp_path = None
         video_path = None
@@ -342,7 +445,9 @@ class AvatarInference:
             if self.torch.isnan(full_audio_emb).any():
                 return {"error": "Broken audio embedding with NaN values"}
 
-            if os.path.exists(temp_vocal_path):
+            # In fallback mode (no audio-separator), temp_vocal_path == audio_tmp_path.
+            # Don't delete the original audio before ffmpeg muxes it into the output video.
+            if temp_vocal_path != audio_tmp_path and os.path.exists(temp_vocal_path):
                 os.remove(temp_vocal_path)
 
             indices = self.torch.arange(2 * 2 + 1) - 2
@@ -494,13 +599,17 @@ class AvatarInference:
                 shutil.rmtree(os.path.dirname(video_path), ignore_errors=True)
 
 
-@app.function(timeout=60 * 60)
-@modal.fastapi_endpoint(method="POST")
-def inference_endpoint(payload: dict):
-    """
-    HTTP endpoint to call from Gradio/frontend.
-    """
-    return AvatarInference().generate.remote(payload)
+    @modal.method()
+    def generate(self, payload: dict) -> dict:
+        return self._generate_impl(payload)
+
+    @modal.fastapi_endpoint(method="POST")
+    def inference_endpoint(self, payload: dict):
+        """
+        HTTP endpoint to call from Gradio/frontend.
+        Runs directly on the warm GPU class instance.
+        """
+        return self._generate_impl(payload)
 
 
 @app.local_entrypoint()

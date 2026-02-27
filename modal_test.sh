@@ -102,10 +102,32 @@ print(f"Payload written: {payload_path}")
 PY
 
 echo "Sending request to Modal endpoint..."
-curl -sS -X POST "$INFERENCE_API_URL" \
+echo "(This may take 10-30 min on cold start while the model loads into GPU memory)"
+http_code=$(curl -sS -L -X POST "$INFERENCE_API_URL" \
   -H "Content-Type: application/json" \
   -d @"$payload_file" \
-  -o "$response_file"
+  -o "$response_file" \
+  -w "%{http_code}" \
+  --max-time 3600)
+
+echo "HTTP status: $http_code"
+
+# Show raw response for debugging if it's small or an error
+resp_size=$(wc -c < "$response_file" | tr -d ' ')
+if [[ "$resp_size" -eq 0 ]]; then
+  echo "ERROR: Empty response from endpoint (HTTP $http_code)"
+  echo "The GPU worker may still be starting up. Check Modal dashboard for logs."
+  exit 1
+elif [[ "$resp_size" -lt 5000 ]]; then
+  echo "Response body:"
+  cat "$response_file"
+  echo ""
+fi
+
+if [[ "$http_code" != "200" ]]; then
+  echo "ERROR: Non-200 response (HTTP $http_code). See response above."
+  exit 1
+fi
 
 echo "Decoding response..."
 python3 - <<'PY' "$response_file" "$output_video"
@@ -115,7 +137,11 @@ import sys
 from pathlib import Path
 
 response_path, output_video = sys.argv[1:]
-data = json.loads(Path(response_path).read_text(encoding="utf-8"))
+raw = Path(response_path).read_text(encoding="utf-8")
+if not raw.strip():
+    raise SystemExit("ERROR: Response file is empty")
+
+data = json.loads(raw)
 
 if "error" in data:
     raise SystemExit(f"Endpoint error: {data['error']}")

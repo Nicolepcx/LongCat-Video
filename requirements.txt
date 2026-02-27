@@ -1,42 +1,60 @@
-# ── Core ML ──────────────────────────────────────────────
+# ==========================================================================
+# Merged from original requirements.txt + requirements_avatar.txt
+# with version overrides for deployment compatibility
+# ==========================================================================
+
+# ── Core ML (from original requirements.txt) ─────────────────────────────
 torch==2.6.0
+torchvision==0.21.0
 numpy==1.26.4
-transformers==4.46.3
-diffusers==0.32.2
-accelerate
-safetensors
-peft
+transformers==4.46.3          # upgraded from 4.41.0 for avatar compat
+diffusers==0.32.2             # downgraded from 0.35.1 for avatar compat
 einops==0.8.0
 loguru==0.7.2
 ftfy==6.2.0
+psutil==6.0.0
+accelerate
+safetensors
+peft
 
-# ── Vision / Video ──────────────────────────────────────
+# ── Tokenizer / NLP (implicit deps on RunPod base image) ─────────────────
+sentencepiece                 # needed by UMT5/T5 tokenizer
+protobuf                      # needed by sentencepiece
+tiktoken                      # needed by transformers tokenizer conversion
+regex                         # used in pipeline code
+
+# ── Vision / Video (from original requirements.txt) ──────────────────────
+Pillow
 av==12.0.0
 opencv-python==4.9.0.80
 imageio==2.37.0
 imageio-ffmpeg==0.6.0
+streamlit==1.50.0
+pyarrow==20.0.0
 
-# ── Audio / Avatar ──────────────────────────────────────
-librosa==0.11.0
-soundfile==0.13.1
-pyloudnorm==0.1.1
-audio-separator==0.30.2
-onnxruntime==1.16.3
-scipy==1.15.3
-soxr==0.5.0.post1
-
-# ── Scientific (avatar deps) ────────────────────────────
+# ── Audio / Avatar (from requirements_avatar.txt) ────────────────────────
 scikit-learn==1.6.1
 scikit-image==0.25.2
+scipy==1.15.3
+soundfile==0.13.1
+soxr==0.5.0.post1
+librosa==0.11.0
 sympy==1.13.1
+audio-separator==0.30.2
+pyloudnorm==0.1.1
+onnx==1.18.0
+onnxruntime==1.16.3
 
-# ── Utilities ────────────────────────────────────────────
-psutil==6.0.0
+# ── System / Misc (from requirements_avatar.txt) ─────────────────────────
+nvidia-ml-py==13.580.65
+tzdata==2025.2
+cffi==2.0.0
+chardet==5.2.0
 tqdm
-regex
+huggingface_hub
 
-# ── Serving / Deployment ────────────────────────────────
+# ── Serving / Deployment ─────────────────────────────────────────────────
 runpod
 
-# ── NOTE: flash-attn must be installed separately ───────
+# ── NOTE: flash-attn must be installed separately ────────────────────────
 # pip install flash-attn --no-build-isolation
