@@ -103,7 +103,7 @@ PY
 
 echo "Sending request to Modal endpoint..."
 echo "(This may take 10-30 min on cold start while the model loads into GPU memory)"
-http_code=$(curl -sS -L -X POST "$INFERENCE_API_URL" \
+http_code=$(curl -sS -L "$INFERENCE_API_URL" \
   -H "Content-Type: application/json" \
   -d @"$payload_file" \
   -o "$response_file" \

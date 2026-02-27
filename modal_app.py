@@ -370,6 +370,7 @@ class AvatarInference:
     def _generate_impl(self, payload: dict) -> dict:
         audio_tmp_path = None
         image_tmp_path = None
+        temp_vocal_path = None
         video_path = None
         try:
             if "audio_base64" not in payload:
@@ -445,10 +446,11 @@ class AvatarInference:
             if self.torch.isnan(full_audio_emb).any():
                 return {"error": "Broken audio embedding with NaN values"}
 
-            # In fallback mode (no audio-separator), temp_vocal_path == audio_tmp_path.
-            # Don't delete the original audio before ffmpeg muxes it into the output video.
-            if temp_vocal_path != audio_tmp_path and os.path.exists(temp_vocal_path):
-                os.remove(temp_vocal_path)
+            # audio-separator can alter/remove the original input file in some environments.
+            # Keep whichever audio path exists and use it for final ffmpeg mux.
+            mux_audio_path = audio_tmp_path if audio_tmp_path and os.path.exists(audio_tmp_path) else temp_vocal_path
+            if not mux_audio_path or not os.path.exists(mux_audio_path):
+                return {"error": "No audio file available for ffmpeg mux"}
 
             indices = self.torch.arange(2 * 2 + 1) - 2
             audio_start_idx = 0
@@ -486,7 +488,7 @@ class AvatarInference:
                 video = [self.PIL.Image.fromarray(img) for img in video]
                 output_tensor = self.torch.from_numpy(self.np.array(video))
                 self.save_video_ffmpeg(
-                    output_tensor, os.path.join(out_dir, "at2v_demo_1"), audio_tmp_path, fps=save_fps, quality=5
+                    output_tensor, os.path.join(out_dir, "at2v_demo_1"), mux_audio_path, fps=save_fps, quality=5
                 )
                 del output
                 self._torch_gc()
@@ -511,7 +513,7 @@ class AvatarInference:
                 video = [self.PIL.Image.fromarray(img) for img in video]
                 output_tensor = self.torch.from_numpy(self.np.array(video))
                 self.save_video_ffmpeg(
-                    output_tensor, os.path.join(out_dir, "ai2v_demo_1"), audio_tmp_path, fps=save_fps, quality=5
+                    output_tensor, os.path.join(out_dir, "ai2v_demo_1"), mux_audio_path, fps=save_fps, quality=5
                 )
                 del output
                 self._torch_gc()
@@ -572,7 +574,7 @@ class AvatarInference:
                     self.save_video_ffmpeg(
                         output_tensor,
                         os.path.join(out_dir, f"video_continue_{seg_idx + 1}"),
-                        audio_tmp_path,
+                        mux_audio_path,
                         fps=save_fps,
                         quality=5,
                     )
@@ -592,7 +594,7 @@ class AvatarInference:
         except Exception as exc:
             return {"error": str(exc)}
         finally:
-            for p in [audio_tmp_path, image_tmp_path]:
+            for p in [audio_tmp_path, image_tmp_path, temp_vocal_path]:
                 if p and os.path.exists(p):
                     os.unlink(p)
             if video_path and os.path.exists(video_path):

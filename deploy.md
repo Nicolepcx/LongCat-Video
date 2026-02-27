@@ -116,6 +116,21 @@ torchrun --nproc_per_node=1 run_demo_avatar_single_audio_to_video.py \
   --input_json assets/avatar/single_example_1.json
 ```
 
+If you want a reproducible "current-code" run with all fixes from this debugging session
+(pip recovery, version pinning, single-GPU env vars, and JSON creation), run:
+
+```bash
+cd /workspace/LongCat-Video
+chmod +x runpod_repro_current.sh
+bash runpod_repro_current.sh
+```
+
+Optional force-sync on a fresh pod:
+
+```bash
+FORCE_SYNC=1 bash runpod_repro_current.sh
+```
+
 The setup script handles:
 - System deps (`ffmpeg`, `libsndfile1`)
 - Python requirements
