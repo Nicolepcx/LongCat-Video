@@ -26,12 +26,13 @@ from __future__ import annotations
 
 import base64
 import datetime
-import math
 import os
 import random
 import shutil
+import subprocess
 import tempfile
 import time
+from collections import deque
 from pathlib import Path
 
 import modal
@@ -45,21 +46,23 @@ OUTPUT_DIR = "/tmp/outputs"
 
 
 def _image() -> modal.Image:
-    # Use CUDA base image and install Python + project dependencies.
+    # Strict parity path: mirror the working RunPod container/setup sequence.
     return (
-        modal.Image.from_registry("nvidia/cuda:12.4.1-devel-ubuntu22.04", add_python="3.11")
-        .apt_install("ffmpeg", "libsndfile1", "git")
-        # requirements.txt is needed during image build, so copy it into the image layer.
+        modal.Image.from_registry("runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04")
         .add_local_file("requirements.txt", "/tmp/requirements.txt", copy=True)
+        .add_local_file("requirements_avatar.txt", "/tmp/requirements_avatar.txt", copy=True)
         .run_commands(
-            "pip install -U pip packaging ninja",
-            # audio-separator pulls demucs/diffq, which can fail wheel builds on Modal.
-            # We install a filtered requirements set and fallback to raw audio in code.
-            "grep -v '^audio-separator' /tmp/requirements.txt > /tmp/requirements_modal.txt",
-            "pip install -r /tmp/requirements_modal.txt",
+            # Follow notebook-proven install flow, avoiding streamlit/blinker conflicts.
+            "pip install -U pip",
+            "pip install torch==2.6.0+cu124 torchvision==0.21.0+cu124 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124",
+            "pip install -U packaging ninja",
+            "pip install flash_attn==2.7.4.post1 --no-build-isolation",
+            "pip install -r /tmp/requirements_avatar.txt",
+            # Notebook overrides that matched your successful RunPod behavior.
+            "pip install -U diffusers==0.32.2 transformers==4.46.3 accelerate safetensors peft einops librosa soundfile pyloudnorm audio-separator onnxruntime imageio imageio-ffmpeg av opencv-python loguru ftfy psutil numpy==1.26.4",
             "pip install 'fastapi[standard]>=0.115.0'",
-            # Try flash-attn, but don't fail build if unavailable.
-            "pip install --no-build-isolation --no-cache-dir flash-attn || true",
+            # Ensure runtime deps used by audio-separator path are present.
+            "pip install onnx2torch pydub sentencepiece protobuf tiktoken regex",
         )
         .workdir("/root/LongCat-Video")
         # Add project source last so Modal can mount local files at container startup.
@@ -199,178 +202,25 @@ def download_weights(hf_token: str | None = None, force: bool = False) -> dict:
     gpu="A100-80GB",
     memory=262144,  # 256 GB system RAM — needed to load ~200GB of weights
     timeout=60 * 60,
-    scaledown_window=60 * 5,
+    scaledown_window=60,  # scale down GPU quickly after each request
     volumes={VOLUME_MOUNT_PATH: weights_volume},
 )
 class AvatarInference:
     @modal.enter()
     def load(self):
-        import sys
-        t0 = time.time()
-        def _log(msg):
-            elapsed = time.time() - t0
-            print(f"[{elapsed:7.1f}s] {msg}", flush=True)
-
-        _log("Starting model load ...")
-        _log("Importing libraries ...")
-        import librosa
-        import numpy as np
-        import PIL.Image
-        import torch
-        import torch.distributed as dist
-        from diffusers.utils import load_image
-        from transformers import AutoTokenizer, UMT5EncoderModel, Wav2Vec2FeatureExtractor
-        _log("Core imports done")
-
-        from longcat_video.audio_process.torch_utils import save_video_ffmpeg
-        from longcat_video.audio_process.wav2vec2 import Wav2Vec2ModelWrapper
-        from longcat_video.context_parallel import context_parallel_util
-        from longcat_video.modules.autoencoder_kl_wan import AutoencoderKLWan
-        from longcat_video.modules.avatar.longcat_video_dit_avatar import LongCatVideoAvatarTransformer3DModel
-        from longcat_video.modules.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
-        from longcat_video.pipeline_longcat_video_avatar import LongCatVideoAvatarPipeline
-        _log("Project imports done")
-
-        self.np = np
-        self.PIL = PIL
-        self.torch = torch
-        self.librosa = librosa
-        self.load_image = load_image
-        self.save_video_ffmpeg = save_video_ffmpeg
-
-        base_model_dir = os.path.join(WEIGHTS_DIR, "LongCat-Video")
-        avatar_weights_dir = os.path.join(WEIGHTS_DIR, "LongCat-Video-Avatar")
-
-        if not os.path.exists(base_model_dir) or not os.path.exists(avatar_weights_dir):
-            raise RuntimeError(
-                f"Missing weights in {WEIGHTS_DIR}. Run download_weights first."
-            )
-
-        _log(f"GPU available: {torch.cuda.is_available()}")
-        if torch.cuda.is_available():
-            _log(f"GPU: {torch.cuda.get_device_name(0)}")
-            _log(f"GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
-
-        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-        os.environ.setdefault("MASTER_PORT", "29500")
-        os.environ.setdefault("RANK", "0")
-        os.environ.setdefault("WORLD_SIZE", "1")
-        os.environ.setdefault("LOCAL_RANK", "0")
-
-        _log("Initializing process group ...")
-        try:
-            if not dist.is_initialized():
-                dist.init_process_group(
-                    backend="nccl",
-                    timeout=datetime.timedelta(seconds=3600),
-                )
-        except Exception:
-            if not dist.is_initialized():
-                dist.init_process_group(
-                    backend="gloo",
-                    timeout=datetime.timedelta(seconds=3600),
-                )
-        _log("Process group initialized")
-
-        self.local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-        if torch.cuda.is_available():
-            torch.cuda.set_device(self.local_rank)
-
-        context_parallel_util.init_context_parallel(
-            context_parallel_size=1,
-            global_rank=dist.get_rank(),
-            world_size=dist.get_world_size(),
-        )
-        cp_split_hw = context_parallel_util.get_optimal_split(1)
-
-        _log("Loading tokenizer ...")
-        tokenizer = AutoTokenizer.from_pretrained(
-            base_model_dir, subfolder="tokenizer", torch_dtype=torch.bfloat16
-        )
-        _log("Loading text_encoder ...")
-        text_encoder = UMT5EncoderModel.from_pretrained(
-            base_model_dir, subfolder="text_encoder", torch_dtype=torch.bfloat16
-        )
-        _log("Loading vae ...")
-        vae = AutoencoderKLWan.from_pretrained(
-            base_model_dir, subfolder="vae", torch_dtype=torch.bfloat16
-        )
-        _log("Loading scheduler ...")
-        scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-            base_model_dir, subfolder="scheduler", torch_dtype=torch.bfloat16
-        )
-        _log("Loading dit (avatar_single) — this is the largest component ...")
-        dit = LongCatVideoAvatarTransformer3DModel.from_pretrained(
-            avatar_weights_dir,
-            subfolder="avatar_single",
-            cp_split_hw=cp_split_hw,
-            torch_dtype=torch.bfloat16,
-        )
-        _log("dit loaded")
-
-        _log("Loading wav2vec audio encoder ...")
-        wav2vec_path = os.path.join(avatar_weights_dir, "chinese-wav2vec2-base")
-        audio_encoder = Wav2Vec2ModelWrapper(wav2vec_path).to(self.local_rank)
-        audio_encoder.feature_extractor._freeze_parameters()
-        wav2vec_feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(
-            wav2vec_path, local_files_only=True
-        )
-        _log("wav2vec loaded")
-
-        self.vocal_separator = None
-        try:
-            from audio_separator.separator import Separator
-
-            vocal_separator_path = os.path.join(
-                avatar_weights_dir, "vocal_separator/Kim_Vocal_2.onnx"
-            )
-            self.audio_output_dir_temp = Path("/tmp/audio_temp")
-            self.audio_output_dir_temp.mkdir(parents=True, exist_ok=True)
-            self.vocal_separator = Separator(
-                output_dir=self.audio_output_dir_temp / "vocals",
-                output_single_stem="vocals",
-                model_file_dir=os.path.dirname(vocal_separator_path),
-            )
-            self.vocal_separator.load_model(os.path.basename(vocal_separator_path))
-        except Exception:
-            # Fallback path for environments where audio-separator isn't installed.
-            self.vocal_separator = None
-
-        _log("Building pipeline ...")
-        self.pipe = LongCatVideoAvatarPipeline(
-            tokenizer=tokenizer,
-            text_encoder=text_encoder,
-            vae=vae,
-            scheduler=scheduler,
-            dit=dit,
-            audio_encoder=audio_encoder,
-            wav2vec_feature_extractor=wav2vec_feature_extractor,
-        )
-        self.pipe.to(self.local_rank)
-        _log("Pipeline moved to GPU")
-
+        self.base_model_dir = os.path.join(WEIGHTS_DIR, "LongCat-Video")
+        self.avatar_weights_dir = os.path.join(WEIGHTS_DIR, "LongCat-Video-Avatar")
+        self.script_path = "/root/LongCat-Video/run_demo_avatar_single_audio_to_video.py"
+        if not os.path.exists(self.base_model_dir) or not os.path.exists(self.avatar_weights_dir):
+            raise RuntimeError(f"Missing weights in {WEIGHTS_DIR}. Run download_weights first.")
+        if not os.path.exists(self.script_path):
+            raise RuntimeError(f"Missing script: {self.script_path}")
         os.makedirs(OUTPUT_DIR, exist_ok=True)
-        _log(f"✓ Model fully loaded in {time.time() - t0:.1f}s — ready for inference")
-
-    def _torch_gc(self):
-        self.torch.cuda.empty_cache()
-        self.torch.cuda.ipc_collect()
-
-    def _extract_vocal_from_speech(self, source_path: str, target_path: str):
-        if self.vocal_separator is None:
-            return source_path
-        outputs = self.vocal_separator.separate(source_path)
-        if len(outputs) <= 0:
-            return None
-        default_vocal_path = self.audio_output_dir_temp / "vocals" / outputs[0]
-        default_vocal_path = default_vocal_path.resolve().as_posix()
-        shutil.move(default_vocal_path, target_path)
-        return target_path
+        os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
     def _generate_impl(self, payload: dict) -> dict:
-        audio_tmp_path = None
-        image_tmp_path = None
-        temp_vocal_path = None
+        req_tmp_dir = None
+        out_dir = None
         video_path = None
         try:
             if "audio_base64" not in payload:
@@ -380,212 +230,116 @@ class AvatarInference:
             if stage == "ai2v" and not payload.get("image_base64"):
                 return {"error": "ai2v stage requires image_base64"}
 
-            # Decode request files
-            raw_audio = base64.b64decode(payload["audio_base64"])
-            audio_tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-            audio_tmp.write(raw_audio)
-            audio_tmp.close()
-            audio_tmp_path = audio_tmp.name
-
-            if payload.get("image_base64"):
-                raw_image = base64.b64decode(payload["image_base64"])
-                image_tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-                image_tmp.write(raw_image)
-                image_tmp.close()
-                image_tmp_path = image_tmp.name
-
-            prompt = payload.get("prompt", "A person speaking naturally")
-            negative_prompt = payload.get("negative_prompt") or (
-                "Close-up, Bright tones, overexposed, static, blurred details, subtitles, "
-                "style, works, paintings, images, static, overall gray, worst quality, "
-                "low quality, JPEG compression residue, ugly, incomplete, extra fingers, "
-                "poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, "
-                "fused fingers, still picture, messy background, three legs, many people in the "
-                "background, walking backwards"
-            )
-
-            resolution = payload.get("resolution", "480p")
-            num_inference_steps = int(payload.get("num_inference_steps", 50))
-            text_guidance_scale = float(payload.get("text_guidance_scale", 4.0))
-            audio_guidance_scale = float(payload.get("audio_guidance_scale", 4.0))
-            num_segments = max(1, int(payload.get("num_segments", 1)))
-            seed = int(payload.get("seed", 42))
-
-            save_fps = 16
-            num_frames = 93
-            num_cond_frames = 13
-            audio_stride = 2
-            if resolution == "720p":
-                height, width = 768, 1280
-            else:
-                height, width = 480, 832
-
-            generator = self.torch.Generator(device=self.local_rank)
-            generator.manual_seed(seed)
-
-            temp_vocal_path = self._extract_vocal_from_speech(
-                audio_tmp_path,
-                f"/tmp/temp_speech_{_generate_random_uid()}_vocal.wav",
-            )
-            if temp_vocal_path is None or not os.path.exists(temp_vocal_path):
-                return {"error": "No vocal detected in provided audio"}
-
-            generate_duration = (
-                num_frames / save_fps
-                + (num_segments - 1) * (num_frames - num_cond_frames) / save_fps
-            )
-            speech_array, sr = self.librosa.load(temp_vocal_path, sr=16000)
-            source_duration = len(speech_array) / sr
-            added_samples = math.ceil((generate_duration - source_duration) * sr)
-            if added_samples > 0:
-                speech_array = self.np.append(speech_array, [0.0] * added_samples)
-
-            full_audio_emb = self.pipe.get_audio_embedding(
-                speech_array, fps=save_fps * audio_stride, device=self.local_rank, sample_rate=sr
-            )
-            if self.torch.isnan(full_audio_emb).any():
-                return {"error": "Broken audio embedding with NaN values"}
-
-            # audio-separator can alter/remove the original input file in some environments.
-            # Keep whichever audio path exists and use it for final ffmpeg mux.
-            mux_audio_path = audio_tmp_path if audio_tmp_path and os.path.exists(audio_tmp_path) else temp_vocal_path
-            if not mux_audio_path or not os.path.exists(mux_audio_path):
-                return {"error": "No audio file available for ffmpeg mux"}
-
-            indices = self.torch.arange(2 * 2 + 1) - 2
-            audio_start_idx = 0
-            audio_end_idx = audio_start_idx + audio_stride * num_frames
-            center_indices = (
-                self.torch.arange(audio_start_idx, audio_end_idx, audio_stride).unsqueeze(1)
-                + indices.unsqueeze(0)
-            )
-            center_indices = self.torch.clamp(
-                center_indices, min=0, max=full_audio_emb.shape[0] - 1
-            )
-            audio_emb = full_audio_emb[center_indices][None, ...].to(self.local_rank)
-
             uid = _generate_random_uid()
+            req_tmp_dir = tempfile.mkdtemp(prefix=f"modal_req_{uid}_")
             out_dir = os.path.join(OUTPUT_DIR, uid)
             os.makedirs(out_dir, exist_ok=True)
 
-            if stage == "at2v":
-                output_tuple = self.pipe.generate_at2v(
-                    prompt=prompt,
-                    negative_prompt=negative_prompt,
-                    height=height,
-                    width=width,
-                    num_frames=num_frames,
-                    num_inference_steps=num_inference_steps,
-                    text_guidance_scale=text_guidance_scale,
-                    audio_guidance_scale=audio_guidance_scale,
-                    generator=generator,
-                    output_type="both",
-                    audio_emb=audio_emb,
-                )
-                output, latent = output_tuple
-                output = output[0]
-                video = [(output[i] * 255).astype(self.np.uint8) for i in range(output.shape[0])]
-                video = [self.PIL.Image.fromarray(img) for img in video]
-                output_tensor = self.torch.from_numpy(self.np.array(video))
-                self.save_video_ffmpeg(
-                    output_tensor, os.path.join(out_dir, "at2v_demo_1"), mux_audio_path, fps=save_fps, quality=5
-                )
-                del output
-                self._torch_gc()
-            elif stage == "ai2v":
-                image = self.load_image(image_tmp_path)
-                output_tuple = self.pipe.generate_ai2v(
-                    image=image,
-                    prompt=prompt,
-                    negative_prompt=negative_prompt,
-                    resolution=resolution,
-                    num_frames=num_frames,
-                    num_inference_steps=num_inference_steps,
-                    text_guidance_scale=text_guidance_scale,
-                    audio_guidance_scale=audio_guidance_scale,
-                    output_type="both",
-                    generator=generator,
-                    audio_emb=audio_emb,
-                )
-                output, latent = output_tuple
-                output = output[0]
-                video = [(output[i] * 255).astype(self.np.uint8) for i in range(output.shape[0])]
-                video = [self.PIL.Image.fromarray(img) for img in video]
-                output_tensor = self.torch.from_numpy(self.np.array(video))
-                self.save_video_ffmpeg(
-                    output_tensor, os.path.join(out_dir, "ai2v_demo_1"), mux_audio_path, fps=save_fps, quality=5
-                )
-                del output
-                self._torch_gc()
-            else:
-                return {"error": f"Unsupported stage: {stage}"}
+            audio_ext = payload.get("audio_ext") or ".wav"
+            if not audio_ext.startswith("."):
+                audio_ext = f".{audio_ext}"
+            audio_path = os.path.join(req_tmp_dir, f"input_audio{audio_ext}")
+            with open(audio_path, "wb") as f:
+                f.write(base64.b64decode(payload["audio_base64"]))
 
-            if num_segments > 1:
-                ref_img_index = 10
-                mask_frame_range = 3
-                w_, h_ = video[0].size
-                current_video = video
-                ref_latent = latent[:, :, :1].clone()
-                all_generated_frames = list(video)
+            image_path = None
+            if payload.get("image_base64"):
+                image_path = os.path.join(req_tmp_dir, "input_image.png")
+                with open(image_path, "wb") as f:
+                    f.write(base64.b64decode(payload["image_base64"]))
 
-                for seg_idx in range(1, num_segments):
-                    audio_start_idx += audio_stride * (num_frames - num_cond_frames)
-                    audio_end_idx = audio_start_idx + audio_stride * num_frames
-                    center_indices = (
-                        self.torch.arange(audio_start_idx, audio_end_idx, audio_stride).unsqueeze(1)
-                        + indices.unsqueeze(0)
+            stage_1 = payload.get("stage", "ai2v")
+            if stage_1 not in {"ai2v", "at2v"}:
+                return {"error": f"Unsupported stage: {stage_1}"}
+
+            prompt = payload.get("prompt", "A person speaking naturally")
+            input_json_data = {
+                "prompt": prompt,
+                "cond_audio": {"person1": audio_path},
+            }
+            if stage_1 == "ai2v":
+                if not image_path:
+                    return {"error": "ai2v stage requires image_base64"}
+                input_json_data["cond_image"] = image_path
+
+            input_json_path = os.path.join(req_tmp_dir, "input.json")
+            with open(input_json_path, "w", encoding="utf-8") as f:
+                import json
+                json.dump(input_json_data, f)
+
+            env = os.environ.copy()
+            env["RANK"] = "0"
+            env["WORLD_SIZE"] = "1"
+            env["LOCAL_RANK"] = "0"
+            env["MASTER_ADDR"] = "127.0.0.1"
+            env["MASTER_PORT"] = str(29500 + random.randint(0, 1000))
+            env["BASE_MODEL_DIR"] = self.base_model_dir
+            env["AVATAR_WEIGHTS_DIR"] = self.avatar_weights_dir
+            env.setdefault("TOKENIZERS_PARALLELISM", "false")
+            env.setdefault("PYTHONUNBUFFERED", "1")
+
+            cmd = [
+                "python",
+                self.script_path,
+                "--input_json", input_json_path,
+                "--output_dir", out_dir,
+                "--resolution", payload.get("resolution", "480p"),
+                "--num_inference_steps", str(int(payload.get("num_inference_steps", 50))),
+                "--text_guidance_scale", str(float(payload.get("text_guidance_scale", 4.0))),
+                "--audio_guidance_scale", str(float(payload.get("audio_guidance_scale", 4.0))),
+                "--num_segments", str(max(1, int(payload.get("num_segments", 1)))),
+                "--stage_1", stage_1,
+                "--context_parallel_size", "1",
+                "--base_model_dir", self.base_model_dir,
+                "--checkpoint_dir", self.avatar_weights_dir,
+            ]
+
+            log_tail = deque(maxlen=120)
+            proc = subprocess.Popen(
+                cmd,
+                env=env,
+                cwd="/root/LongCat-Video",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            start_t = time.time()
+            try:
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    print(line.rstrip(), flush=True)
+                    log_tail.append(line.rstrip())
+                    if time.time() - start_t > 60 * 60 * 3:
+                        proc.kill()
+                        return {"error": "Script timed out after 3 hours"}
+                rc = proc.wait()
+            except Exception:
+                proc.kill()
+                rc = proc.wait()
+
+            if rc != 0:
+                tail_out = "\n".join(log_tail)
+                return {
+                    "error": (
+                        f"Script failed with code {rc}\n"
+                        f"--- combined log tail ---\n{tail_out}"
                     )
-                    center_indices = self.torch.clamp(
-                        center_indices, min=0, max=full_audio_emb.shape[0] - 1
-                    )
-                    audio_emb = full_audio_emb[center_indices][None, ...].to(self.local_rank)
+                }
 
-                    output_tuple = self.pipe.generate_avc(
-                        video=current_video,
-                        video_latent=latent,
-                        prompt=prompt,
-                        negative_prompt=negative_prompt,
-                        height=h_,
-                        width=w_,
-                        num_frames=num_frames,
-                        num_cond_frames=num_cond_frames,
-                        num_inference_steps=num_inference_steps,
-                        text_guidance_scale=text_guidance_scale,
-                        audio_guidance_scale=audio_guidance_scale,
-                        generator=generator,
-                        output_type="both",
-                        use_kv_cache=True,
-                        offload_kv_cache=False,
-                        enhance_hf=True,
-                        audio_emb=audio_emb,
-                        ref_latent=ref_latent,
-                        ref_img_index=ref_img_index,
-                        mask_frame_range=mask_frame_range,
-                    )
-                    output, latent = output_tuple
-                    output = output[0]
-                    new_video = [(output[i] * 255).astype(self.np.uint8) for i in range(output.shape[0])]
-                    new_video = [self.PIL.Image.fromarray(img) for img in new_video]
-                    del output
-
-                    all_generated_frames.extend(new_video[num_cond_frames:])
-                    current_video = new_video
-                    output_tensor = self.torch.from_numpy(self.np.array(all_generated_frames))
-                    self.save_video_ffmpeg(
-                        output_tensor,
-                        os.path.join(out_dir, f"video_continue_{seg_idx + 1}"),
-                        mux_audio_path,
-                        fps=save_fps,
-                        quality=5,
-                    )
-                    del output_tensor
-
+            num_segments = max(1, int(payload.get("num_segments", 1)))
             if num_segments > 1:
                 video_path = os.path.join(out_dir, f"video_continue_{num_segments}.mp4")
-            elif stage == "at2v":
+            elif stage_1 == "at2v":
                 video_path = os.path.join(out_dir, "at2v_demo_1.mp4")
             else:
                 video_path = os.path.join(out_dir, "ai2v_demo_1.mp4")
+
+            if not os.path.exists(video_path):
+                candidates = sorted(Path(out_dir).glob("*.mp4"), key=lambda p: p.stat().st_mtime)
+                if not candidates:
+                    return {"error": f"No output mp4 found in {out_dir}"}
+                video_path = str(candidates[-1])
 
             with open(video_path, "rb") as f:
                 video_b64 = base64.b64encode(f.read()).decode("utf-8")
@@ -594,9 +348,8 @@ class AvatarInference:
         except Exception as exc:
             return {"error": str(exc)}
         finally:
-            for p in [audio_tmp_path, image_tmp_path, temp_vocal_path]:
-                if p and os.path.exists(p):
-                    os.unlink(p)
+            if req_tmp_dir and os.path.exists(req_tmp_dir):
+                shutil.rmtree(req_tmp_dir, ignore_errors=True)
             if video_path and os.path.exists(video_path):
                 shutil.rmtree(os.path.dirname(video_path), ignore_errors=True)
 
